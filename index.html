@@ -56,22 +56,14 @@
     <main class="max-w-5xl mx-auto py-10 px-6">
       <div x-show="step === 'shop'" class="animate-in fade-in duration-500">
         <h2 class="text-2xl font-bold mb-8 text-gray-800">Select Services</h2>
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
           <template x-for="product in products" :key="product.id">
             <div
-              class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col justify-between hover:shadow-md transition relative overflow-hidden"
-              :class="product.isSubscription ? 'ring-2 ring-purple-500 bg-purple-50' : ''"
+              class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col justify-between hover:shadow-md transition"
             >
-              <div
-                x-show="product.isSubscription"
-                class="absolute top-0 right-0 bg-purple-600 text-white text-[10px] font-bold px-3 py-1 rounded-bl-lg tracking-widest"
-              >
-                RECURRING
-              </div>
               <div>
                 <div
-                  class="w-12 h-12 rounded-lg mb-4 flex items-center justify-center font-bold"
-                  :class="product.isSubscription ? 'bg-purple-200 text-purple-700' : 'bg-blue-50 text-blue-600'"
+                  class="w-12 h-12 bg-blue-50 text-blue-600 rounded-lg mb-4 flex items-center justify-center font-bold"
                 >
                   JOD
                 </div>
@@ -82,17 +74,10 @@
                 <p class="text-gray-500 text-sm mt-2" x-text="product.desc"></p>
               </div>
               <div class="mt-8 flex justify-between items-center">
-                <div>
-                  <span
-                    class="font-black text-xl text-gray-900"
-                    x-text="product.price.toFixed(2)"
-                  ></span>
-                  <span
-                    x-show="product.isSubscription"
-                    class="text-xs text-gray-500 font-medium"
-                    >/mo</span
-                  >
-                </div>
+                <span
+                  class="font-black text-xl text-gray-900"
+                  x-text="product.price.toFixed(2)"
+                ></span>
                 <button
                   @click="addToCart(product)"
                   class="bg-black text-white px-6 py-2 rounded-xl text-sm font-bold hover:bg-gray-800 active:scale-95 transition"
@@ -109,8 +94,10 @@
           class="fixed bottom-8 left-1/2 -translate-x-1/2 bg-white shadow-2xl border border-gray-200 px-8 py-5 rounded-3xl flex items-center gap-10"
         >
           <div>
-            <p class="text-xs text-gray-400 uppercase font-bold tracking-widest">
-              Total Due Today
+            <p
+              class="text-xs text-gray-400 uppercase font-bold tracking-widest"
+            >
+              Total Amount
             </p>
             <span
               class="font-black text-2xl text-black"
@@ -179,202 +166,243 @@
     </main>
 
     <script>
-      // ── Server URL — update when deploying ────────────────────────────────
-      const SERVER_URL = "https://bae-subscription-backend.onrender.com";
-
       function cartSystem() {
         return {
           step: "shop",
-          environment: "prod",
+          environment: "prod", // Defaults to Production
           loading: false,
           loadingMessage: "Initializing...",
           products: [
-            { id: 1, name: "Basic Plan",        price: 0.10, desc: "Entry level tier." },
-            { id: 2, name: "Standard Plan",     price: 0.20, desc: "Most popular tier." },
-            { id: 3, name: "Premium Plan",      price: 0.30, desc: "The highest tier test." },
-            { id: 4, name: "VIP Subscription",  price: 0.05, desc: "Monthly recurring test module.", isSubscription: true },
+            {
+              id: 1,
+              name: "Basic Plan",
+              price: 0.1,
+              desc: "Entry level tier.",
+            },
+            {
+              id: 2,
+              name: "Standard Plan",
+              price: 0.2,
+              desc: "Most popular tier.",
+            },
+            {
+              id: 3,
+              name: "Premium Plan",
+              price: 0.3,
+              desc: "The highest tier test.",
+            },
           ],
           cart: [],
           total: 0,
-          hasSubscription: false,
 
           addToCart(product) {
             this.cart.push(product);
-            this.total           = this.cart.reduce((sum, item) => sum + item.price, 0);
-            this.hasSubscription = this.cart.some((item) => item.isSubscription);
-          },
-
-          showSuccess(title, body) {
-            this.loading = false;
-            document.getElementById("payment-selection-container").innerHTML = "";
-            document.getElementById("payment-screen-container").innerHTML = `
-              <div class="text-center py-10 animate-in zoom-in duration-500">
-                <div class="w-20 h-20 bg-green-500 text-white rounded-full flex items-center justify-center mx-auto mb-6 text-4xl shadow-lg shadow-green-200">✓</div>
-                <h3 class="text-2xl font-black text-gray-900">${title}</h3>
-                <p class="text-gray-500 mt-2 font-medium">${body}</p>
-                <button onclick="window.location.reload()" class="mt-8 text-blue-600 font-bold hover:underline">Start New Test</button>
-              </div>
-            `;
-            if (window.ReactNativeWebView) {
-              window.ReactNativeWebView.postMessage(JSON.stringify({ event: "payment_success" }));
-            }
+            this.total = this.cart.reduce((sum, item) => sum + item.price, 0);
           },
 
           async initiateCheckout() {
-            this.step    = "checkout";
+            this.step = "checkout";
             this.loading = true;
-            this.loadingMessage = `Connecting to Server (${this.environment.toUpperCase()})...`;
-            document.getElementById("payment-selection-container").innerHTML = "";
-            document.getElementById("payment-screen-container").innerHTML    = "";
+            this.loadingMessage = `Connecting to Proxy (${this.environment.toUpperCase()})...`;
+            document.getElementById("payment-selection-container").innerHTML =
+              "";
+            document.getElementById("payment-screen-container").innerHTML = "";
 
             try {
-              // ── Step 1: Fetch Capture Context ────────────────────────────
-              const response = await fetch(`${SERVER_URL}/api/capture-context`, {
-                method:  "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  totalAmount:    this.total.toFixed(2),
-                  origin:         window.location.origin,
-                  environment:    this.environment,
-                  isSubscription: this.hasSubscription,
-                }),
+              // ---> INJECT ENVIRONMENT FLAG HERE <---
+              const payload = JSON.stringify({
+                totalAmount: this.total.toFixed(2),
+                origin: window.location.origin,
+                environment: this.environment,
               });
 
+              const response = await fetch(
+                "https://bae-api-proxy.z-kulaghsi.workers.dev",
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: payload,
+                },
+              );
+
               const rawText = await response.text();
-              if (!response.ok) throw new Error(`Server Request Failed (${response.status}): ${rawText}`);
+
+              console.log("🔥 RAW BACKEND RESPONSE:", rawText);
+
+              if (!response.ok) {
+                throw new Error(
+                  `Proxy Request Failed (Status: ${response.status})\n\nResponse: ${rawText}`,
+                );
+              }
 
               this.loadingMessage = "Token received. Downloading SDK...";
 
-              // ── Step 2: Parse the capture context token ──────────────────
               let captureContextToken;
               try {
-                const parsed = JSON.parse(rawText);
-                if (typeof parsed === "string")    captureContextToken = parsed;
-                else if (parsed && parsed.token)   captureContextToken = parsed.token;
-                else throw new Error("Unexpected format: " + rawText);
+                const parsedData = JSON.parse(rawText);
+                if (typeof parsedData === "string") {
+                  captureContextToken = parsedData;
+                } else if (parsedData && parsedData.token) {
+                  captureContextToken = parsedData.token;
+                } else {
+                  throw new Error("Unexpected API format: " + rawText);
+                }
               } catch (e) {
-                if (!captureContextToken) captureContextToken = rawText.replace(/^"|"$/g, "").trim();
+                if (!captureContextToken) {
+                  captureContextToken = rawText.replace(/^"|"$/g, "").trim();
+                }
               }
 
-              // ── Step 3: Decode JWT and extract SDK URL ───────────────────
-              const decodedPayload = JSON.parse(atob(captureContextToken.split(".")[1]));
-              console.log("🔥 Allowed payment types:", decodedPayload.ctx[0].data.allowedPaymentTypes);
+              const decodedPayload = JSON.parse(
+                atob(captureContextToken.split(".")[1]),
+              );
 
-              const sdkUrl       = decodedPayload.ctx[0].data.clientLibrary;
-              const sdkIntegrity = decodedPayload.ctx[0].data.clientLibraryIntegrity || null;
+              console.log("🔥 --- TOKEN DEBUG INFO --- 🔥");
+              console.log(`Environment: ${this.environment.toUpperCase()}`);
+              console.log(
+                "Bank's Allowed Payments:",
+                decodedPayload.ctx[0].data.allowedPaymentTypes,
+              );
+              console.log("🔥 ------------------------ 🔥");
 
-              // ── Step 4: Inject CyberSource SDK ───────────────────────────
-              const existing = document.querySelector('script[data-cybersource-sdk="true"]');
+              const sdkUrl = decodedPayload.ctx[0].data.clientLibrary;
+              const sdkIntegrity =
+                decodedPayload.ctx[0].data.clientLibraryIntegrity || null;
+
+              const existing = document.querySelector(
+                'script[data-cybersource-sdk="true"]',
+              );
               if (existing) existing.remove();
               delete window.Accept;
               delete window.VAS;
               delete window.CyberSource;
 
               await new Promise((resolve, reject) => {
-                const script       = document.createElement("script");
-                script.src         = sdkUrl;
-                script.async       = true;
-                script.type        = "text/javascript";
+                const script = document.createElement("script");
+                script.src = sdkUrl;
+                script.async = true;
+                script.type = "text/javascript";
                 script.setAttribute("data-cybersource-sdk", "true");
-                if (sdkIntegrity) { script.integrity = sdkIntegrity; script.crossOrigin = "anonymous"; }
-                script.onload  = () => setTimeout(resolve, 200);
-                script.onerror = () => reject(new Error("Failed to load CyberSource SDK"));
+
+                if (sdkIntegrity) {
+                  script.integrity = sdkIntegrity;
+                  script.crossOrigin = "anonymous";
+                }
+
+                script.onload = () => setTimeout(resolve, 200);
+                script.onerror = () =>
+                  reject(new Error("Failed to load CyberSource SDK"));
                 document.body.appendChild(script);
               });
 
               this.loadingMessage = "Rendering secure fields...";
 
               try {
-                if (!window.Accept) throw new Error("Accept SDK unavailable after load");
+                if (!window.Accept)
+                  throw new Error("Accept SDK unavailable after load");
 
-                // ── Step 5: Initialize SDK and render UI ─────────────────
-                const accept         = await Accept(captureContextToken);
-                const up             = await accept.unifiedPayments();
-                this.loading         = false;
+                const accept = await Accept(captureContextToken);
+                const up = await accept.unifiedPayments();
+
+                this.loading = false;
 
                 const transientToken = await up.show({
-                  containers: { paymentSelection: "#payment-selection-container" },
+                  containers: {
+                    paymentSelection: "#payment-selection-container",
+                  },
                 });
 
-                if (!transientToken) throw new Error("No transient token returned from show()");
+                if (!transientToken)
+                  throw new Error("No transient token returned from show()");
 
-                this.loading        = true;
+                this.loading = true;
                 this.loadingMessage = "Completing authentication...";
 
-                // ── Step 6: Trigger 3DS / Digital Wallets ────────────────
                 const completeResult = await up.complete(transientToken);
 
-                // Decode result to check authorization status
                 let decodedResult = {};
                 try {
-                  if (typeof completeResult === "string" && completeResult.includes(".")) {
-                    decodedResult = JSON.parse(atob(completeResult.split(".")[1]));
+                  if (
+                    typeof completeResult === "string" &&
+                    completeResult.includes(".")
+                  ) {
+                    decodedResult = JSON.parse(
+                      atob(completeResult.split(".")[1]),
+                    );
                   }
                 } catch (e) {
                   console.warn("Could not decode completeResult as JWT", e);
                 }
 
-                console.log("✅ completeResult decoded:", decodedResult);
+                if (
+                  decodedResult.status === "AUTHORIZED" ||
+                  decodedResult.outcome === "AUTHORIZED"
+                ) {
+                  this.loading = false;
+                  document.getElementById(
+                    "payment-selection-container",
+                  ).innerHTML = "";
 
-                // ── Auto-authorized: Google Pay / Apple Pay ───────────────
-                // These wallets charge immediately inside up.complete().
-                // We still need to save the subscription to Firestore separately.
-                if (decodedResult.status === "AUTHORIZED" || decodedResult.outcome === "AUTHORIZED") {
-
-                  // Save subscription if applicable
-                  if (this.hasSubscription) {
-                    try {
-                      this.loadingMessage = "Saving subscription...";
-                      const saveRes = await fetch(`${SERVER_URL}/api/save-subscription`, {
-                        method:  "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                          completeResultJwt: completeResult,
-                          totalAmount:       this.total.toFixed(2),
-                          environment:       this.environment,
-                        }),
-                      });
-                      const saveData = await saveRes.json();
-                      console.log("💾 Subscription save response:", saveData);
-                    } catch (saveErr) {
-                      console.warn("Could not save wallet subscription:", saveErr.message);
-                    }
+                  if (window.ReactNativeWebView) {
+                    window.ReactNativeWebView.postMessage(
+                      JSON.stringify({ event: "payment_success" }),
+                    );
                   }
 
-                  const title = this.hasSubscription ? "Subscription Activated!" : "Payment Successful!";
-                  const body  = this.hasSubscription
-                    ? `Your card has been saved securely for monthly billing (${this.environment.toUpperCase()}).`
-                    : `Auto-authorized securely via CyberSource (${this.environment.toUpperCase()}).`;
-
-                  this.showSuccess(title, body);
+                  document.getElementById(
+                    "payment-screen-container",
+                  ).innerHTML = `
+                      <div class="text-center py-10 animate-in zoom-in duration-500">
+                        <div class="w-20 h-20 bg-green-500 text-white rounded-full flex items-center justify-center mx-auto mb-6 text-4xl shadow-lg shadow-green-200">✓</div>
+                        <h3 class="text-2xl font-black text-gray-900">Payment Successful!</h3>
+                        <p class="text-gray-500 mt-2 font-medium">Auto-Authorized securely via CyberSource (${this.environment.toUpperCase()}).</p>
+                        <button onclick="window.location.reload()" class="mt-8 text-blue-600 font-bold hover:underline">Start New Test</button>
+                      </div>
+                    `;
                   return;
                 }
 
-                // ── Step 7: Standard card — finalize via server ──────────
                 this.loadingMessage = "Processing final payment...";
-                document.getElementById("payment-selection-container").innerHTML = "";
+                document.getElementById(
+                  "payment-selection-container",
+                ).innerHTML = "";
 
-                const finalRes = await fetch(`${SERVER_URL}/api/process-payment`, {
-                  method:  "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    transientToken: completeResult,
-                    environment:    this.environment,
-                    isSubscription: this.hasSubscription,
-                    totalAmount:    this.total.toFixed(2),
-                  }),
-                });
+                // ---> INJECT ENVIRONMENT FLAG HERE <---
+                const finalChargeResponse = await fetch(
+                  "https://bae-api-proxy.z-kulaghsi.workers.dev/process-payment",
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      transientToken: completeResult,
+                      environment: this.environment,
+                    }),
+                  },
+                );
 
-                const chargeResultRaw = await finalRes.text();
-                if (!finalRes.ok) throw new Error(`Charge Failed: ${chargeResultRaw}`);
+                const chargeResultRaw = await finalChargeResponse.text();
 
-                const title = this.hasSubscription ? "Subscription Activated!" : "Payment Successful!";
-                const body  = this.hasSubscription
-                  ? `Your card has been vaulted securely for monthly billing.`
-                  : `Your ${this.environment.toUpperCase()} transaction has been processed securely.`;
+                if (!finalChargeResponse.ok) {
+                  throw new Error(`Charge Failed: ${chargeResultRaw}`);
+                }
 
-                this.showSuccess(title, body);
+                this.loading = false;
 
+                if (window.ReactNativeWebView) {
+                  window.ReactNativeWebView.postMessage(
+                    JSON.stringify({ event: "payment_success" }),
+                  );
+                }
+
+                document.getElementById("payment-screen-container").innerHTML =
+                  `
+                  <div class="text-center py-10 animate-in zoom-in duration-500">
+                    <div class="w-20 h-20 bg-green-500 text-white rounded-full flex items-center justify-center mx-auto mb-6 text-4xl shadow-lg shadow-green-200">✓</div>
+                    <h3 class="text-2xl font-black text-gray-900">Payment Successful!</h3>
+                    <p class="text-gray-500 mt-2 font-medium">Your ${this.environment.toUpperCase()} transaction has been processed securely.</p>
+                    <button onclick="window.location.reload()" class="mt-8 text-blue-600 font-bold hover:underline">Start New Test</button>
+                  </div>
+                `;
               } catch (renderError) {
                 console.error("Payment Process Error:", renderError);
                 alert("Error processing payment:\n\n" + renderError.message);
