@@ -253,9 +253,38 @@
                 }
               }
 
+              // --- NEW SAFER JWT DECODE LOGIC ---
+              const tokenParts = captureContextToken.split(".");
+
+              if (tokenParts.length < 2) {
+                throw new Error(
+                  "Invalid token format received from Bank: " +
+                    captureContextToken,
+                );
+              }
+
+              // 1. Convert Base64URL to standard Base64 (replace - with +, _ with /)
+              let base64 = tokenParts[1].replace(/-/g, "+").replace(/_/g, "/");
+
+              // 2. Pad the string with "=" so its length is a multiple of 4 (required by some browsers)
+              while (base64.length % 4) {
+                base64 += "=";
+              }
+
+              // 3. Safely decode, handling special characters
               const decodedPayload = JSON.parse(
-                atob(captureContextToken.split(".")[1]),
+                decodeURIComponent(
+                  atob(base64)
+                    .split("")
+                    .map(function (c) {
+                      return (
+                        "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2)
+                      );
+                    })
+                    .join(""),
+                ),
               );
+              // ----------------------------------
 
               console.log("🔥 --- TOKEN DEBUG INFO --- 🔥");
               console.log(`Environment: ${this.environment.toUpperCase()}`);
