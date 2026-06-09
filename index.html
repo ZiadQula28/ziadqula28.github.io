@@ -339,6 +339,23 @@
                   containers: {
                     paymentSelection: "#payment-selection-container",
                   },
+                  // INJECT YOUR CUSTOM UI COLORS HERE
+                  styles: {
+                    input: {
+                      color: "#1f2937", // Text color
+                      "font-size": "16px",
+                      "font-family": "ui-sans-serif, system-ui, sans-serif",
+                    },
+                    ":focus": {
+                      color: "#2563eb", // Blue color when clicking the field
+                    },
+                    valid: {
+                      color: "#16a34a", // Green when card is correct
+                    },
+                    invalid: {
+                      color: "#dc2626", // Red when card is wrong
+                    },
+                  },
                 });
 
                 if (!transientToken)
