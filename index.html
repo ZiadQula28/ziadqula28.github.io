@@ -85,7 +85,7 @@
                     type="number"
                     min="0.10"
                     step="0.10"
-                    x-model="customAmount"
+                    x-model.number="product.price"
                     class="w-24 px-2 py-1 border-2 border-gray-200 rounded-lg font-black text-xl text-gray-900 focus:border-blue-600 focus:outline-none transition"
                   />
                 </div>
@@ -206,7 +206,7 @@
             {
               id: 4,
               name: "Custom Amount",
-              price: 0, // Base price is 0, overridden by customAmount
+              price: 1, // Base price is 0, overridden by customAmount
               desc: "Enter your preferred amount.",
               isCustom: true, // Flag to tell the UI to render the input box
             },
