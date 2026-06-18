@@ -75,9 +75,21 @@
               </div>
               <div class="mt-8 flex justify-between items-center">
                 <span
+                  x-show="!product.isCustom"
                   class="font-black text-xl text-gray-900"
                   x-text="product.price.toFixed(2)"
                 ></span>
+
+                <div x-show="product.isCustom" class="flex items-center">
+                  <input
+                    type="number"
+                    min="0.10"
+                    step="0.10"
+                    x-model="customAmount"
+                    class="w-24 px-2 py-1 border-2 border-gray-200 rounded-lg font-black text-xl text-gray-900 focus:border-blue-600 focus:outline-none transition"
+                  />
+                </div>
+
                 <button
                   @click="addToCart(product)"
                   class="bg-black text-white px-6 py-2 rounded-xl text-sm font-bold hover:bg-gray-800 active:scale-95 transition"
@@ -191,12 +203,30 @@
               price: 0.3,
               desc: "The highest tier test.",
             },
+            {
+              id: 4,
+              name: "Custom Amount",
+              price: 0, // Base price is 0, overridden by customAmount
+              desc: "Enter your preferred amount.",
+              isCustom: true, // Flag to tell the UI to render the input box
+            },
           ],
           cart: [],
           total: 0,
 
           addToCart(product) {
-            this.cart.push(product);
+            let finalPrice = product.isCustom
+              ? parseFloat(this.customAmount)
+              : product.price;
+
+            // Failsafe to prevent adding empty or negative amounts
+            if (isNaN(finalPrice) || finalPrice <= 0) {
+              alert("Please enter a valid amount greater than 0.");
+              return;
+            }
+
+            // Push a cloned version of the product to the cart so multiple custom amounts don't overwrite each other
+            this.cart.push({ ...product, price: finalPrice });
             this.total = this.cart.reduce((sum, item) => sum + item.price, 0);
           },
 
