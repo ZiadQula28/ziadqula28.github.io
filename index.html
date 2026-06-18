@@ -85,7 +85,7 @@
                     type="number"
                     min="0.10"
                     step="0.10"
-                    x-model.number="product.price"
+                    x-model.number="customAmount"
                     class="w-24 px-2 py-1 border-2 border-gray-200 rounded-lg font-black text-xl text-gray-900 focus:border-blue-600 focus:outline-none transition"
                   />
                 </div>
@@ -184,6 +184,7 @@
           environment: "prod", // Defaults to Production
           loading: false,
           loadingMessage: "Initializing...",
+          customAmount: 1.0, // CRITICAL: This is the default amount for the custom input
           products: [
             {
               id: 1,
@@ -206,7 +207,7 @@
             {
               id: 4,
               name: "Custom Amount",
-              price: 1, // Base price is 0, overridden by customAmount
+              price: 0, // Base price is 0, overridden by customAmount
               desc: "Enter your preferred amount.",
               isCustom: true, // Flag to tell the UI to render the input box
             },
@@ -215,13 +216,18 @@
           total: 0,
 
           addToCart(product) {
-            let finalPrice = parseFloat(product.price);
+            // Check if it's the custom product; if so, grab 'this.customAmount', otherwise grab 'product.price'
+            let finalPrice = product.isCustom
+              ? parseFloat(this.customAmount)
+              : parseFloat(product.price);
 
+            // Failsafe to prevent adding empty or negative amounts
             if (isNaN(finalPrice) || finalPrice <= 0) {
               alert("Please enter a valid amount greater than 0.");
               return;
             }
 
+            // Push a cloned version of the product to the cart
             this.cart.push({ ...product, price: finalPrice });
             this.total = this.cart.reduce((sum, item) => sum + item.price, 0);
           },
@@ -235,7 +241,6 @@
             document.getElementById("payment-screen-container").innerHTML = "";
 
             try {
-              // ---> INJECT ENVIRONMENT FLAG HERE <---
               const payload = JSON.stringify({
                 totalAmount: this.total.toFixed(2),
                 origin: window.location.origin,
@@ -279,7 +284,6 @@
                 }
               }
 
-              // --- NEW SAFER JWT DECODE LOGIC ---
               const tokenParts = captureContextToken.split(".");
 
               if (tokenParts.length < 2) {
@@ -289,15 +293,12 @@
                 );
               }
 
-              // 1. Convert Base64URL to standard Base64 (replace - with +, _ with /)
               let base64 = tokenParts[1].replace(/-/g, "+").replace(/_/g, "/");
 
-              // 2. Pad the string with "=" so its length is a multiple of 4 (required by some browsers)
               while (base64.length % 4) {
                 base64 += "=";
               }
 
-              // 3. Safely decode, handling special characters
               const decodedPayload = JSON.parse(
                 decodeURIComponent(
                   atob(base64)
@@ -310,7 +311,6 @@
                     .join(""),
                 ),
               );
-              // ----------------------------------
 
               console.log("🔥 --- TOKEN DEBUG INFO --- 🔥");
               console.log(`Environment: ${this.environment.toUpperCase()}`);
@@ -365,24 +365,23 @@
                   containers: {
                     paymentSelection: "#payment-selection-container",
                   },
-                  // INJECTING OBNOXIOUS COLORS FOR TESTING
                   styles: {
                     submitButton: {
-                      backgroundColor: "#8b5cf6", // Bright Purple "Continue" button
+                      backgroundColor: "#8b5cf6",
                       color: "#ffffff",
                       "border-radius": "12px",
                     },
                     label: {
-                      color: "#ea580c", // Bright Orange text for "Card number", "Expiry", etc.
+                      color: "#ea580c",
                       "font-weight": "bold",
                     },
                     input: {
-                      color: "#2563eb", // Bright Blue text when typing inside the boxes
+                      color: "#2563eb",
                       "border-radius": "8px",
-                      border: "2px solid #8b5cf6", // Purple borders around the inputs
+                      border: "2px solid #8b5cf6",
                     },
                     paymentOptionItem: {
-                      background: "#fef08a", // Bright Yellow for the "Debit/Credit" selection button
+                      background: "#fef08a",
                       border: "2px solid #ea580c",
                     },
                   },
@@ -443,7 +442,6 @@
                   "payment-selection-container",
                 ).innerHTML = "";
 
-                // ---> INJECT ENVIRONMENT FLAG HERE <---
                 const finalChargeResponse = await fetch(
                   "https://bae-api-proxy.z-kulaghsi.workers.dev/process-payment",
                   {
