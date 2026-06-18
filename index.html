@@ -215,17 +215,13 @@
           total: 0,
 
           addToCart(product) {
-            let finalPrice = product.isCustom
-              ? parseFloat(this.customAmount)
-              : product.price;
+            let finalPrice = parseFloat(product.price);
 
-            // Failsafe to prevent adding empty or negative amounts
             if (isNaN(finalPrice) || finalPrice <= 0) {
               alert("Please enter a valid amount greater than 0.");
               return;
             }
 
-            // Push a cloned version of the product to the cart so multiple custom amounts don't overwrite each other
             this.cart.push({ ...product, price: finalPrice });
             this.total = this.cart.reduce((sum, item) => sum + item.price, 0);
           },
