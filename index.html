@@ -17,6 +17,7 @@
       <div class="max-w-5xl mx-auto flex justify-between items-center">
         <div class="flex items-center gap-4">
           <h1 class="text-xl font-bold text-gray-800 italic">Payments+</h1>
+
           <div
             @click="environment = environment === 'prod' ? 'dev' : 'prod'"
             class="flex items-center bg-gray-200 rounded-full p-1 cursor-pointer w-32 relative h-8 select-none"
@@ -36,6 +37,28 @@
             <div
               class="absolute top-1 bottom-1 w-[46%] rounded-full transition-all duration-300 shadow"
               :class="environment === 'prod' ? 'left-1 bg-green-500' : 'left-[50%] bg-blue-600'"
+            ></div>
+          </div>
+
+          <div
+            @click="currency = currency === 'JOD' ? 'USD' : 'JOD'"
+            class="flex items-center bg-gray-200 rounded-full p-1 cursor-pointer w-32 relative h-8 select-none"
+          >
+            <div
+              class="w-1/2 text-center z-10 text-[10px] font-bold tracking-widest transition-colors duration-300"
+              :class="currency === 'JOD' ? 'text-white' : 'text-gray-500'"
+            >
+              JOD
+            </div>
+            <div
+              class="w-1/2 text-center z-10 text-[10px] font-bold tracking-widest transition-colors duration-300"
+              :class="currency === 'USD' ? 'text-white' : 'text-gray-500'"
+            >
+              USD
+            </div>
+            <div
+              class="absolute top-1 bottom-1 w-[46%] rounded-full transition-all duration-300 shadow"
+              :class="currency === 'JOD' ? 'left-1 bg-gray-800' : 'left-[50%] bg-gray-800'"
             ></div>
           </div>
         </div>
@@ -64,9 +87,8 @@
               <div>
                 <div
                   class="w-12 h-12 bg-blue-50 text-blue-600 rounded-lg mb-4 flex items-center justify-center font-bold"
-                >
-                  JOD
-                </div>
+                  x-text="currency"
+                ></div>
                 <h3
                   class="font-bold text-lg text-gray-900"
                   x-text="product.name"
@@ -113,7 +135,7 @@
             </p>
             <span
               class="font-black text-2xl text-black"
-              x-text="total.toFixed(2) + ' JOD'"
+              x-text="total.toFixed(2) + ' ' + currency"
             ></span>
           </div>
           <button
@@ -145,12 +167,16 @@
               :class="environment === 'prod' ? 'bg-green-500' : 'bg-blue-600'"
               x-text="environment.toUpperCase()"
             ></span>
+            <span
+              class="text-[10px] font-bold px-2 py-1 rounded tracking-widest text-white bg-gray-800"
+              x-text="currency"
+            ></span>
           </div>
           <div class="flex justify-between items-center mb-8 border-b pb-4">
             <span class="text-gray-500">Amount Due:</span>
             <span
               class="text-xl font-bold text-blue-600"
-              x-text="total.toFixed(2) + ' JOD'"
+              x-text="total.toFixed(2) + ' ' + currency"
             ></span>
           </div>
 
@@ -181,10 +207,11 @@
       function cartSystem() {
         return {
           step: "shop",
-          environment: "prod", // Defaults to Production
+          environment: "prod",
+          currency: "JOD", // Defaults to JOD
           loading: false,
           loadingMessage: "Initializing...",
-          customAmount: 1.0, // CRITICAL: This is the default amount for the custom input
+          customAmount: 1.0,
           products: [
             {
               id: 1,
@@ -207,27 +234,24 @@
             {
               id: 4,
               name: "Custom Amount",
-              price: 0, // Base price is 0, overridden by customAmount
+              price: 0,
               desc: "Enter your preferred amount.",
-              isCustom: true, // Flag to tell the UI to render the input box
+              isCustom: true,
             },
           ],
           cart: [],
           total: 0,
 
           addToCart(product) {
-            // Check if it's the custom product; if so, grab 'this.customAmount', otherwise grab 'product.price'
             let finalPrice = product.isCustom
               ? parseFloat(this.customAmount)
               : parseFloat(product.price);
 
-            // Failsafe to prevent adding empty or negative amounts
             if (isNaN(finalPrice) || finalPrice <= 0) {
               alert("Please enter a valid amount greater than 0.");
               return;
             }
 
-            // Push a cloned version of the product to the cart
             this.cart.push({ ...product, price: finalPrice });
             this.total = this.cart.reduce((sum, item) => sum + item.price, 0);
           },
@@ -245,6 +269,7 @@
                 totalAmount: this.total.toFixed(2),
                 origin: window.location.origin,
                 environment: this.environment,
+                currency: this.currency, // PASSED DYNAMICALLY TO WORKER
               });
 
               const response = await fetch(
@@ -258,7 +283,7 @@
 
               const rawText = await response.text();
 
-              console.log("🔥 RAW BACKEND RESPONSE:", rawText);
+              console.log("RAW BACKEND RESPONSE:", rawText);
 
               if (!response.ok) {
                 throw new Error(
@@ -312,13 +337,14 @@
                 ),
               );
 
-              console.log("🔥 --- TOKEN DEBUG INFO --- 🔥");
+              console.log("--- TOKEN DEBUG INFO ---");
               console.log(`Environment: ${this.environment.toUpperCase()}`);
+              console.log(`Currency: ${this.currency.toUpperCase()}`);
               console.log(
                 "Bank's Allowed Payments:",
                 decodedPayload.ctx[0].data.allowedPaymentTypes,
               );
-              console.log("🔥 ------------------------ 🔥");
+              console.log("------------------------");
 
               const sdkUrl = decodedPayload.ctx[0].data.clientLibrary;
               const sdkIntegrity =
@@ -430,7 +456,7 @@
                       <div class="text-center py-10 animate-in zoom-in duration-500">
                         <div class="w-20 h-20 bg-green-500 text-white rounded-full flex items-center justify-center mx-auto mb-6 text-4xl shadow-lg shadow-green-200">✓</div>
                         <h3 class="text-2xl font-black text-gray-900">Payment Successful!</h3>
-                        <p class="text-gray-500 mt-2 font-medium">Auto-Authorized securely via CyberSource (${this.environment.toUpperCase()}).</p>
+                        <p class="text-gray-500 mt-2 font-medium">Auto-Authorized securely via CyberSource (${this.environment.toUpperCase()} - ${this.currency}).</p>
                         <button onclick="window.location.reload()" class="mt-8 text-blue-600 font-bold hover:underline">Start New Test</button>
                       </div>
                     `;
@@ -473,7 +499,7 @@
                   <div class="text-center py-10 animate-in zoom-in duration-500">
                     <div class="w-20 h-20 bg-green-500 text-white rounded-full flex items-center justify-center mx-auto mb-6 text-4xl shadow-lg shadow-green-200">✓</div>
                     <h3 class="text-2xl font-black text-gray-900">Payment Successful!</h3>
-                    <p class="text-gray-500 mt-2 font-medium">Your ${this.environment.toUpperCase()} transaction has been processed securely.</p>
+                    <p class="text-gray-500 mt-2 font-medium">Your ${this.environment.toUpperCase()} transaction (${this.currency}) has been processed securely.</p>
                     <button onclick="window.location.reload()" class="mt-8 text-blue-600 font-bold hover:underline">Start New Test</button>
                   </div>
                 `;
