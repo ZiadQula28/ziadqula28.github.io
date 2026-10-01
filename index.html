@@ -29,6 +29,15 @@
             class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white bg-gray-800"
             x-text="currency"
           ></button>
+          <!-- AUTH vs CAPTURE toggle: only meaningful on the direct CYBS path -->
+          <button
+            x-show="environment === 'cybersource'"
+            @click="captureMode = captureMode === 'capture' ? 'auth' : 'capture'"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white"
+            :class="captureMode === 'auth' ? 'bg-amber-600' : 'bg-gray-800'"
+            :title="captureMode === 'auth' ? 'Authorize only (hold funds)' : 'Authorize + Capture (sale)'"
+            x-text="captureMode === 'auth' ? 'PRE-AUTH' : 'CAPTURE'"
+          ></button>
           <label
             class="flex items-center gap-2 text-xs font-medium text-gray-600"
           >
@@ -153,7 +162,9 @@
               <div class="text-xs">
                 <p class="font-bold text-amber-900">Capture context JWT</p>
                 <p class="text-amber-700 font-mono break-all">
-                  <span x-text="captureContext ? captureContext.length : 0"></span>
+                  <span
+                    x-text="captureContext ? captureContext.length : 0"
+                  ></span>
                   chars · <span x-text="jwtMerchantLabel"></span>
                 </p>
               </div>
@@ -434,6 +445,7 @@
           phase: "idle", // idle | rendering | armed | completing | stalled | charging | done
           environment: "prod",
           currency: "JOD",
+          captureMode: "capture", // "capture" (sale) | "auth" (hold); CYBS only
           forceManualConfirm: false,
           loading: false,
           loadingMessage: "Initialising…",
@@ -441,6 +453,8 @@
           cart: [],
           total: 0,
           reference: null,
+          heldAuthRef: null, // reference of an AUTH-held txn awaiting capture
+          capturing: false,
           log: [],
           t0: Date.now(),
           diag: {
@@ -540,7 +554,10 @@
 
             const decoded = this.decodeJwt(token);
             const data =
-              (decoded && decoded.ctx && decoded.ctx[0] && decoded.ctx[0].data) ||
+              (decoded &&
+                decoded.ctx &&
+                decoded.ctx[0] &&
+                decoded.ctx[0].data) ||
               {};
 
             // Merchant identity — compare this against the MID you published
@@ -566,7 +583,9 @@
             const themeKeys = Object.keys(data).filter((k) =>
               /theme|style|brand|colou?r|font|button|look|feel/i.test(k),
             );
-            this.diag.theme = themeKeys.length ? themeKeys.join(", ") : "ABSENT";
+            this.diag.theme = themeKeys.length
+              ? themeKeys.join(", ")
+              : "ABSENT";
             this.logLine("theme-ish keys in JWT: " + this.diag.theme);
 
             if (data.clientVersion) {
@@ -647,6 +666,11 @@
                   currency: this.currency,
                   environment: this.environment,
                   origin: window.location.origin,
+                  // Only the CYBS path honors this; harmless on the BAE path.
+                  mode:
+                    this.environment === "cybersource"
+                      ? this.captureMode
+                      : undefined,
                 }),
               });
 
@@ -795,6 +819,15 @@
             const decoded = this.decodeJwt(result);
             const status = decoded.status || decoded.outcome;
 
+            // On the direct CYBS path we always record the result server-side
+            // (charge() posts to /cybs/result). That's what stores the auth
+            // transaction id and tells us whether a follow-on capture is
+            // available (AUTH mode) or the sale is already done (CAPTURE mode).
+            if (this.environment === "cybersource") {
+              return this.charge(result);
+            }
+
+            // BAE path: AUTHORIZED here means already captured (sale).
             if (status === "AUTHORIZED") {
               this.logLine("auto-authorised, no capture call needed");
               window.BaePay.settled = true;
@@ -839,9 +872,31 @@
                 });
                 const data = await res.json();
                 this.logLine(
-                  "cybs result recorded · txn " + (data.transactionId || "n/a"),
+                  "cybs result recorded · txn " +
+                    (data.transactionId || "n/a") +
+                    " · " +
+                    (data.status || "?"),
                 );
                 window.BaePay.settled = true;
+
+                // AUTH mode: funds are HELD, not captured. Remember this
+                // reference and offer a Capture button.
+                if (data.status === "AUTHORIZED_HELD") {
+                  if (data.captureAvailable) {
+                    this.heldAuthRef = this.reference;
+                    return this.showSuccess(
+                      "Authorized (funds held) — ready to capture",
+                    );
+                  }
+                  // Held but we couldn't get an auth id to capture with.
+                  this.logLine(
+                    "WARNING: authorized but no transaction id returned — " +
+                      "capture not available (see worker log)",
+                  );
+                  return this.showSuccess("Authorized (funds held)");
+                }
+
+                // CAPTURE mode: sale complete.
                 return this.showSuccess("Paid");
               } catch (err) {
                 this.fail("Result recording failed: " + err.message);
@@ -937,6 +992,15 @@
                 }),
               );
             }
+            // If this was an AUTH-only hold, offer a Capture button that
+            // collects the held funds via /cybs/capture.
+            const captureBtn = this.heldAuthRef
+              ? '<button id="capture-held-btn" ' +
+                'class="mt-6 mb-1 block mx-auto px-5 py-2.5 rounded-xl bg-amber-600 text-white font-bold">' +
+                "Capture held funds</button>" +
+                '<p class="text-gray-400 text-xs mt-1">Funds are authorized (held) but not yet collected.</p>'
+              : "";
+
             document.getElementById("payment-screen-container").innerHTML =
               '<div class="text-center py-10">' +
               '<div class="w-16 h-16 bg-green-600 text-white rounded-full flex items-center justify-center mx-auto mb-4 text-3xl">✓</div>' +
@@ -946,8 +1010,68 @@
               '<p class="text-gray-500 mt-2 text-sm font-mono">' +
               this.reference +
               "</p>" +
+              captureBtn +
               '<button onclick="window.location.reload()" class="mt-6 text-blue-600 font-bold">Run another test</button>' +
               "</div>";
+
+            // Wire the capture button (added via innerHTML, so bind directly).
+            if (this.heldAuthRef) {
+              const btn = document.getElementById("capture-held-btn");
+              if (btn) btn.addEventListener("click", () => this.captureHeld());
+            }
+          },
+
+          /* ---------------- follow-on capture (pre-auth flow) ---------- */
+          async captureHeld() {
+            if (!this.heldAuthRef || this.capturing) return;
+            this.capturing = true;
+            const btn = document.getElementById("capture-held-btn");
+            if (btn) {
+              btn.textContent = "Capturing…";
+              btn.disabled = true;
+            }
+            this.logLine("capture → " + this.heldAuthRef);
+            try {
+              const res = await fetch(this.PROXY + "/cybs/capture", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ reference: this.heldAuthRef }),
+              });
+              const data = await res.json();
+              if (!res.ok) {
+                this.logLine(
+                  "capture failed: " +
+                    (data.error || res.status) +
+                    " — " +
+                    JSON.stringify(data.detail || "").slice(0, 200),
+                );
+                if (btn) {
+                  btn.textContent = "Capture failed — retry";
+                  btn.disabled = false;
+                }
+                this.capturing = false;
+                return;
+              }
+              this.logLine(
+                "captured · captureId " +
+                  (data.captureId || "n/a") +
+                  " · status " +
+                  (data.captureStatus || "?"),
+              );
+              this.heldAuthRef = null;
+              if (btn) {
+                btn.textContent = "✓ Captured";
+                btn.classList.remove("bg-amber-600");
+                btn.classList.add("bg-green-600");
+              }
+            } catch (err) {
+              this.logLine("capture error: " + err.message);
+              if (btn) {
+                btn.textContent = "Capture failed — retry";
+                btn.disabled = false;
+              }
+              this.capturing = false;
+            }
           },
 
           fail(message) {
