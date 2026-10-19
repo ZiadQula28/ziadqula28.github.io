@@ -812,9 +812,42 @@
             }, 90000);
           },
 
+          // Sends the signed complete() result to the backend so the webhook
+          // can be matched to this order. text/plain keeps it a "simple"
+          // request (no CORS preflight), which keepalive needs to finish even
+          // if the customer closes the tab right after paying.
+          reportResult(result) {
+            fetch(this.PROXY + "/payment-result", {
+              method: "POST",
+              keepalive: true,
+              headers: { "Content-Type": "text/plain;charset=UTF-8" },
+              body: JSON.stringify({ reference: this.reference, result }),
+            })
+              .then((r) => r.json())
+              .then((d) =>
+                this.logLine(
+                  "result reported · txn " +
+                    (d.transactionId || "n/a") +
+                    " · verified " +
+                    d.verified +
+                    " (" +
+                    (d.verifyNote || "?") +
+                    ") · linked " +
+                    d.linked +
+                    (d.linkNote ? " (" + d.linkNote + ")" : ""),
+                ),
+              )
+              .catch((err) =>
+                this.logLine("result report failed: " + err.message),
+              );
+          },
+
           onCompleteResolved(result) {
             clearTimeout(this.stallTimer);
             this.logLine("complete() resolved");
+
+            // CYBS mode reports through charge() → /cybs/result instead.
+            if (this.environment !== "cybersource") this.reportResult(result);
 
             const decoded = this.decodeJwt(result);
             const status = decoded.status || decoded.outcome;
@@ -875,7 +908,11 @@
                   "cybs result recorded · txn " +
                     (data.transactionId || "n/a") +
                     " · " +
-                    (data.status || "?"),
+                    (data.status || "?") +
+                    " · verified " +
+                    data.verified +
+                    " · linked " +
+                    data.linked,
                 );
                 window.BaePay.settled = true;
 
