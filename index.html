@@ -38,6 +38,15 @@
             :title="captureMode === 'auth' ? 'Authorize only (hold funds)' : 'Authorize + Capture (sale)'"
             x-text="captureMode === 'auth' ? 'PRE-AUTH' : 'CAPTURE'"
           ></button>
+          <!-- Apple Pay on/off: sets allowedPaymentTypes for the session (CYBS path only) -->
+          <button
+            x-show="environment === 'cybersource'"
+            @click="applePayOn = !applePayOn"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white"
+            :class="applePayOn ? 'bg-gray-800' : 'bg-red-700'"
+            :title="applePayOn ? 'Session offers card, Apple Pay, Google Pay' : 'Session offers card and Google Pay only'"
+            x-text="applePayOn ? 'APPLE PAY ON' : 'APPLE PAY OFF'"
+          ></button>
           <label
             class="flex items-center gap-2 text-xs font-medium text-gray-600"
           >
@@ -446,6 +455,7 @@
           environment: "prod",
           currency: "JOD",
           captureMode: "capture", // "capture" (sale) | "auth" (hold); CYBS only
+          applePayOn: true, // CYBS only: include APPLEPAY in allowedPaymentTypes
           forceManualConfirm: false,
           loading: false,
           loadingMessage: "Initialising…",
@@ -591,6 +601,15 @@
             if (data.clientVersion) {
               this.logLine("clientVersion pinned: " + data.clientVersion);
             }
+            // What the session actually offers (proof for the Apple Pay test)
+            this.logLine(
+              "allowedPaymentTypes in JWT: " +
+                JSON.stringify(data.allowedPaymentTypes || null),
+            );
+            this.logLine(
+              "paymentConfigurations in JWT: " +
+                JSON.stringify(Object.keys(data.paymentConfigurations || {})),
+            );
           },
 
           copyJwt() {
@@ -670,6 +689,13 @@
                   mode:
                     this.environment === "cybersource"
                       ? this.captureMode
+                      : undefined,
+                  // CYBS path only: which payment methods this session offers.
+                  paymentTypes:
+                    this.environment === "cybersource"
+                      ? this.applePayOn
+                        ? ["PANENTRY", "APPLEPAY", "GOOGLEPAY"]
+                        : ["PANENTRY", "GOOGLEPAY"]
                       : undefined,
                 }),
               });
@@ -812,42 +838,9 @@
             }, 90000);
           },
 
-          // Sends the signed complete() result to the backend so the webhook
-          // can be matched to this order. text/plain keeps it a "simple"
-          // request (no CORS preflight), which keepalive needs to finish even
-          // if the customer closes the tab right after paying.
-          reportResult(result) {
-            fetch(this.PROXY + "/payment-result", {
-              method: "POST",
-              keepalive: true,
-              headers: { "Content-Type": "text/plain;charset=UTF-8" },
-              body: JSON.stringify({ reference: this.reference, result }),
-            })
-              .then((r) => r.json())
-              .then((d) =>
-                this.logLine(
-                  "result reported · txn " +
-                    (d.transactionId || "n/a") +
-                    " · verified " +
-                    d.verified +
-                    " (" +
-                    (d.verifyNote || "?") +
-                    ") · linked " +
-                    d.linked +
-                    (d.linkNote ? " (" + d.linkNote + ")" : ""),
-                ),
-              )
-              .catch((err) =>
-                this.logLine("result report failed: " + err.message),
-              );
-          },
-
           onCompleteResolved(result) {
             clearTimeout(this.stallTimer);
             this.logLine("complete() resolved");
-
-            // CYBS mode reports through charge() → /cybs/result instead.
-            if (this.environment !== "cybersource") this.reportResult(result);
 
             const decoded = this.decodeJwt(result);
             const status = decoded.status || decoded.outcome;
@@ -908,11 +901,7 @@
                   "cybs result recorded · txn " +
                     (data.transactionId || "n/a") +
                     " · " +
-                    (data.status || "?") +
-                    " · verified " +
-                    data.verified +
-                    " · linked " +
-                    data.linked,
+                    (data.status || "?"),
                 );
                 window.BaePay.settled = true;
 
