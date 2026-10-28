@@ -1085,7 +1085,7 @@
               '<label class="block text-xs text-gray-500 mt-3">Transaction ID</label>' +
               '<input id="cybs-txn" ' + input + ' value="' + this.lastTxnId + '">' +
               '<label class="block text-xs text-gray-500 mt-3">Amount (refund or saved-card charge)</label>' +
-              '<input id="cybs-amount" type="number" step="0.001" ' + input + ' value="' + this.total + '">' +
+              '<input id="cybs-amount" type="number" step="0.001" ' + input + ' value="' + Number(this.total).toFixed(this.currency === "JOD" ? 3 : 2) + '">' +
               '<label class="block text-xs text-gray-500 mt-3">Saved card (customer token)</label>' +
               '<input id="cybs-customer" ' + input + ' value="' + (this.savedCustomerId || "") + '">' +
               '<label class="block text-xs text-gray-500 mt-3">Admin token</label>' +
