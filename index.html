@@ -66,11 +66,81 @@
             />
             Force confirm step
           </label>
+          <!-- Payment tools page: void / refund / charge saved card / look up -->
+          <button
+            @click="step === 'tools' ? (step = 'shop') : openTools()"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white bg-indigo-700"
+            x-text="step === 'tools' ? 'CLOSE TOOLS' : 'TOOLS'"
+          ></button>
         </div>
       </div>
     </nav>
 
     <main class="max-w-5xl mx-auto py-10 px-6">
+      <!-- =========================================================
+           PAYMENT TOOLS: act on any CyberSource transaction directly
+           (CYBS path, worker REST key). Needs CYBS_ADMIN_TOKEN.
+           ========================================================= -->
+      <section x-show="step === 'tools'" class="max-w-xl mx-auto" style="display: none">
+        <button @click="step = 'shop'" class="text-gray-400 mb-4 text-sm hover:text-black">
+          ← Back to shop
+        </button>
+        <div class="bg-white p-6 sm:p-8 rounded-3xl shadow-sm border border-gray-200">
+          <h2 class="text-2xl font-black">Payment tools</h2>
+          <p class="text-sm text-gray-500 mt-1">
+            Void, refund, charge a saved card, or look up any transaction. These call
+            CyberSource directly with the worker's REST key, and need the admin token.
+          </p>
+
+          <label class="block text-xs font-semibold text-gray-500 mt-4">Transaction ID (Request ID)</label>
+          <input x-model.trim="toolTxn" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm" placeholder="e.g. 7933412148216689903092" />
+
+          <div class="flex gap-3">
+            <div class="flex-1">
+              <label class="block text-xs font-semibold text-gray-500 mt-4">Amount (refund or saved-card charge)</label>
+              <input x-model.trim="toolAmount" type="number" step="0.001" min="0.001" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm" placeholder="0.100" />
+            </div>
+            <div class="w-28">
+              <label class="block text-xs font-semibold text-gray-500 mt-4">Currency</label>
+              <select x-model="toolCurrency" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm">
+                <option>JOD</option>
+                <option>USD</option>
+              </select>
+            </div>
+          </div>
+
+          <label class="block text-xs font-semibold text-gray-500 mt-4">Saved card (customer token)</label>
+          <input x-model.trim="toolCustomer" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm" placeholder="needed only for Charge saved card" />
+
+          <label class="block text-xs font-semibold text-gray-500 mt-4">Admin token</label>
+          <input x-model="adminToken" type="password" autocomplete="off" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm" />
+
+          <div class="flex flex-wrap gap-2 mt-5">
+            <button @click="toolAction('void')" :disabled="toolBusy" class="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-50 bg-gray-800">Void</button>
+            <button @click="toolAction('refund')" :disabled="toolBusy" class="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-50 bg-gray-800">Refund</button>
+            <button @click="toolAction('charge')" :disabled="toolBusy" class="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-50 bg-emerald-700">Charge saved card</button>
+            <button @click="toolAction('lookup')" :disabled="toolBusy" class="px-4 py-2 rounded-xl text-sm font-bold border border-gray-300 disabled:opacity-50">Look up</button>
+          </div>
+
+          <p x-show="toolStatus" x-text="toolStatus" class="text-sm mt-4 font-medium"
+             :class="toolOk ? 'text-green-700' : 'text-red-700'"></p>
+
+          <div x-show="toolHistory.length" class="mt-6">
+            <p class="text-xs font-bold tracking-widest text-gray-500">THIS SESSION</p>
+            <ul class="mt-2 space-y-1 text-xs font-mono text-gray-700">
+              <template x-for="(item, i) in toolHistory" :key="i">
+                <li x-text="item"></li>
+              </template>
+            </ul>
+          </div>
+
+          <div x-show="toolLast" class="mt-6">
+            <p class="text-xs font-bold tracking-widest text-gray-500">LAST RESPONSE</p>
+            <pre x-text="toolLast" class="mt-2 text-[11px] bg-gray-50 border border-gray-200 rounded-xl p-3 overflow-auto max-h-80 whitespace-pre-wrap break-all"></pre>
+          </div>
+        </div>
+      </section>
+
       <!-- ------------------------------------------------ shop -->
       <section x-show="step === 'shop'">
         <h2 class="text-2xl font-bold mb-6">Select an amount</h2>
@@ -469,6 +539,16 @@
           adminToken: "", // for void / refund / charge / lookup (CYBS_ADMIN_TOKEN)
           lastTxnId: null, // transaction of the last CYBS payment or charge
           savedCustomerId: null, // TMS customer token from a saved card
+          // Payment tools page
+          toolTxn: "",
+          toolAmount: "",
+          toolCurrency: "JOD",
+          toolCustomer: "",
+          toolBusy: false,
+          toolOk: true,
+          toolStatus: "",
+          toolLast: "",
+          toolHistory: [],
           forceManualConfirm: false,
           loading: false,
           loadingMessage: "Initialising…",
@@ -1123,6 +1203,70 @@
           cybsVal(id) {
             const el = document.getElementById(id);
             return el ? el.value.trim() : "";
+          },
+
+          /* ---------------- Payment tools page ---------------- */
+          openTools() {
+            this.toolTxn = this.toolTxn || this.lastTxnId || "";
+            this.toolCustomer = this.toolCustomer || this.savedCustomerId || "";
+            this.toolCurrency = this.currency;
+            this.step = "tools";
+            window.scrollTo(0, 0);
+          },
+
+          async toolAction(kind) {
+            const paths = {
+              void: "/cybs/void",
+              refund: "/cybs/refund",
+              charge: "/cybs/charge-token",
+              lookup: "/cybs/transaction",
+            };
+            const fail = (t) => { this.toolOk = false; this.toolStatus = t; };
+            if (kind !== "charge" && !this.toolTxn) return fail("Enter a transaction ID.");
+            if (kind === "charge" && !this.toolCustomer) return fail("Enter the customer token.");
+            if ((kind === "refund" || kind === "charge") && !(Number(this.toolAmount) > 0))
+              return fail("Enter an amount.");
+
+            const body = { transactionId: this.toolTxn };
+            if (kind === "refund" || kind === "charge") {
+              body.amount = this.toolAmount;
+              body.currency = this.toolCurrency;
+            }
+            if (kind === "charge") body.customerId = this.toolCustomer;
+
+            this.toolBusy = true;
+            this.toolOk = true;
+            this.toolStatus = "Working…";
+            this.logLine("tools " + kind + " → " + JSON.stringify(body));
+            try {
+              const res = await fetch(this.PROXY + paths[kind], {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Admin-Token": this.adminToken || "",
+                },
+                body: JSON.stringify(body),
+              });
+              const data = await res.json().catch(() => ({}));
+              this.toolLast = JSON.stringify(data, null, 2);
+              this.logLine("tools " + kind + " ← " + res.status + " " + JSON.stringify(data).slice(0, 1500));
+              this.toolOk = res.ok;
+              const summary = res.ok
+                ? kind + ": " + (data.status || "ok") +
+                  (data.transactionId ? " · txn " + data.transactionId : "") +
+                  (data.refundId ? " · refund " + data.refundId : "") +
+                  (data.amount ? " · " + data.amount + " " + this.toolCurrency : "")
+                : kind + " failed: " + (data.reason || data.error || "HTTP " + res.status) +
+                  (data.status ? " (status " + data.status + ")" : "");
+              this.toolStatus = summary;
+              this.toolHistory.unshift(new Date().toLocaleTimeString() + "  " + summary);
+              if (kind === "charge" && res.ok && data.transactionId) this.toolTxn = data.transactionId;
+            } catch (err) {
+              this.toolOk = false;
+              this.toolStatus = "Error: " + err.message;
+            } finally {
+              this.toolBusy = false;
+            }
           },
 
           async cybsAction(path, extra) {
