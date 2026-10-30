@@ -1144,7 +1144,7 @@
               const data = await res.json();
               this.logLine(path + " ← " + res.status + " " + JSON.stringify(data).slice(0, 1500));
               if (!res.ok) {
-                say("Failed: " + (data.error || (data.response && (data.response.message || data.response.reason)) || res.status));
+                say("Failed: " + (data.reason || data.error || (data.response && (data.response.message || data.response.reason)) || res.status) + (data.status ? " (status " + data.status + ")" : ""));
                 return;
               }
               if (path === "/cybs/charge-token" && data.transactionId) {
@@ -1236,4 +1236,3 @@
     </script>
   </body>
 </html>
-
