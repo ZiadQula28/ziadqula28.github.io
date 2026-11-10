@@ -29,6 +29,15 @@
             class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white bg-gray-800"
             x-text="currency"
           ></button>
+          <!-- Merchant: main account or the sub-account (BAE path only) -->
+          <button
+            x-show="environment !== 'cybersource'"
+            @click="merchant = merchant === 'main' ? 'sub' : 'main'"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white"
+            :class="merchant === 'sub' ? 'bg-teal-700' : 'bg-gray-800'"
+            :title="merchant === 'sub' ? 'Uses the sub-account key (Worker secret)' : 'Uses the main account key'"
+            x-text="merchant === 'sub' ? 'MERCHANT SUB' : 'MERCHANT MAIN'"
+          ></button>
           <!-- AUTH vs CAPTURE toggle: only meaningful on the direct CYBS path -->
           <button
             x-show="environment === 'cybersource'"
@@ -533,6 +542,7 @@
           phase: "idle", // idle | rendering | armed | completing | stalled | charging | done
           environment: "prod",
           currency: "JOD",
+          merchant: "main", // BAE path only: "main" or "sub" (hierarchy test)
           captureMode: "capture", // "capture" (sale) | "auth" (hold); CYBS only
           applePayOn: true, // CYBS only: include APPLEPAY in allowedPaymentTypes
           saveCard: false, // CYBS only: offer to save the card (TMS)
@@ -680,6 +690,24 @@
               "JWT ctx[0].data keys: " + JSON.stringify(Object.keys(data)),
             );
             this.logLine("JWT issuer/merchant: " + this.jwtMerchantLabel);
+            // Which MID minted this session (main vs sub-account test).
+            const midKey = /^(merchantId|merchantID|mid|organizationId|orgId)$/;
+            const findMid = (o, depth) => {
+              if (!o || typeof o !== "object" || depth > 6) return null;
+              for (const [k, v] of Object.entries(o)) {
+                if (midKey.test(k) && (typeof v === "string" || typeof v === "number"))
+                  return String(v);
+              }
+              for (const v of Object.values(o)) {
+                const hit = findMid(v, depth + 1);
+                if (hit) return hit;
+              }
+              return null;
+            };
+            this.logLine(
+              "JWT merchant ID: " +
+                (findMid(decoded, 0) || "not in token, check the Business Center"),
+            );
 
             // Match loosely: styling key names have moved between SDK
             // versions, so don't assume one spelling.
@@ -778,6 +806,9 @@
                   currency: this.currency,
                   environment: this.environment,
                   origin: window.location.origin,
+                  // BAE path only: which merchant key the worker uses.
+                  merchant:
+                    this.environment === "cybersource" ? undefined : this.merchant,
                   // Only the CYBS path honors this; harmless on the BAE path.
                   mode:
                     this.environment === "cybersource"
@@ -802,7 +833,11 @@
 
               this.reference = data.reference;
               window.BaePay.reference = data.reference;
-              this.logLine("capture context received · ref " + data.reference);
+              this.logLine(
+                "capture context received · ref " +
+                  data.reference +
+                  (data.merchant ? " · merchant " + data.merchant : ""),
+              );
 
               // ---- RAW JWT: surface it before anything can throw --------
               this.captureJwt(data.token);
@@ -1043,6 +1078,7 @@
                   reference: this.reference,
                   transientToken: completeResult,
                   environment: this.environment,
+                  merchant: this.merchant,
                 }),
               });
               const data = await res.json();
