@@ -1,2881 +1,1687 @@
-/**
- * Bank al Etihad – Unified Checkout proxy (Cloudflare Worker)
- * TEST BUILD — credentials inlined per Ziad, test account only.
- *
- * Routes:
- *   POST /capture-context   (also "/")  -> mint capture context, open record
- *   POST /process-payment               -> charge, idempotent per reference
- *   GET  /payment-status?reference=...  -> polled after iOS tab suspension
- *
- * Optional binding: KV namespace PAYMENTS. Without it the Worker falls back
- * to an in-memory map — fine for a single tester, unreliable across isolates.
- */
-
-/* ==================================================================
- * CONFIG — everything you need to touch is in this block
- * ================================================================== */
-//https://ziadqula28.github.io
-const ALLOW_ANY_ORIGIN = true; // flip to false to enforce the list below
-const ALLOWED_ORIGINS = ["https://ziadqula28.github.io"];
-
-// Always appended to targetOrigins alongside the live browsing origin.
-const EXTRA_TARGET_ORIGINS = ["https://ziadqula28.github.io"];
-
-/**
- * false reproduces your original request body byte for byte.
- * true follows the BAE integration guide.
- * Either way the SDK URL now comes from inside the token, so this only
- * changes the response shape — flip it to isolate the variable.
- */
-const WITH_DECODE = false;
-
-const CONFIG = {
-  dev: {
-    captureUrl:
-      "https://merchant-order-token.baelab.net/v1/payments/capture-context",
-    captureAuth: "MDAxMTUwOTkyOilFVj02UU1GX2RDVmdUYW4yUEd+NnBYaCNzRUtrbg==",
-    processUrl:
-      "https://api.apps-console.bankaletihad.com/BAF3E974-52AA-7598-FF04-56945EF93500/045FCC75-62A0-EE53-FF87-4FD683745500/services/businessMarketplace/pay/hostedCheckout",
-    processAuth: "MDAxNjA4Njg3OkNYVFR4KU5Kdlo+QVV9b3E3N1piaW4hZSxwN1ZtMg==", //"MDAxMTUwOTkyOilFVj02UU1GX2RDVmdUYW4yUEd+NnBYaCNzRUtrbg==",
-    companyId: "A4B4A51F-0E6A-41BE-A8FB-5FCCA54C2F58",
-  },
-  prod: {
-    captureUrl:
-      "https://merchant-order-token.bankaletihad.com/v1/payments/app2/capture-context",
-    captureAuth: "MDAxNjA4Njg3OkNYVFR4KU5Kdlo+QVV9b3E3N1piaW4hZSxwN1ZtMg==", //"MDAxNjA4Njg3OkNYVFR4KU5Kdlo+QVV9b3E3N1piaW4hZSxwN1ZtMg=="
-    processUrl:
-      "https://api.apps-console.bankaletihad.com/BAF3E974-52AA-7598-FF04-56945EF93500/045FCC75-62A0-EE53-FF87-4FD683745500/services/businessMarketplace/pay/hostedCheckout",
-    processAuth: "MDAxNjA4Njg3OkNYVFR4KU5Kdlo+QVV9b3E3N1piaW4hZSxwN1ZtMg==",
-    companyId: "6361F8DC-BCAE-4D4A-B903-7B8121A47922",
-    // Sub-account (hierarchy test). Same endpoints as above, its own key.
-    // Picked by MERCHANT SUB on the page.
-    sub: {
-      captureAuth: "MDAxNjA4Njg3OnAyQnZwMlQwaHE9PyxANyFwVnZ4WHdLNDJjMV9FRg",
-      processAuth: "MDAxNjA4Njg3OnAyQnZwMlQwaHE9PyxANyFwVnZ4WHdLNDJjMV9FRg",
-      companyId: null, // add it here if /process-payment is ever needed
-    },
-  },
-};
-
-/**
- * If you ever set a matching Worker secret, it wins over the inline value —
- * so moving to `wrangler secret put` later needs no code change.
- *
- * BAE-path merchants: "main" is the original account, "sub" is the child
- * account in the hierarchy test (CONFIG.prod.sub). Keys are sent exactly as
- * written here, with no padding added.
- */
-const BAE_MERCHANTS = ["main", "sub"];
-
-function resolveConfig(env, environment, merchant = "main") {
-  const isDev = environment === "dev";
-  const base = isDev ? CONFIG.dev : CONFIG.prod;
-
-  if (merchant === "sub") {
-    const tag = isDev ? "DEV" : "PROD";
-    const where = "CONFIG." + (isDev ? "dev" : "prod") + ".sub";
-    const sub = base.sub || {};
-    const captureAuth =
-      env[`BAE_CAPTURE_AUTH_${tag}_SUB`] || sub.captureAuth || null;
-    return {
-      merchant,
-      configured: Boolean(captureAuth),
-      missingField: where + ".captureAuth",
-      companyField: where + ".companyId",
-      captureUrl: base.captureUrl,
-      processUrl: base.processUrl,
-      captureAuth,
-      processAuth:
-        env[`BAE_PROCESS_AUTH_${tag}_SUB`] || sub.processAuth || captureAuth,
-      companyId: env[`BAE_COMPANY_ID_${tag}_SUB`] || sub.companyId || null,
-    };
-  }
-
-  return {
-    merchant: "main",
-    configured: true,
-    captureUrl: base.captureUrl,
-    processUrl: base.processUrl,
-    captureAuth:
-      (isDev ? env.BAE_CAPTURE_AUTH_DEV : env.BAE_CAPTURE_AUTH_PROD) ||
-      base.captureAuth,
-    processAuth:
-      (isDev ? env.BAE_PROCESS_AUTH_DEV : env.BAE_PROCESS_AUTH_PROD) ||
-      base.processAuth,
-    companyId:
-      (isDev ? env.BAE_COMPANY_ID_DEV : env.BAE_COMPANY_ID_PROD) ||
-      base.companyId,
-  };
-}
-
-const RECORD_TTL_SECONDS = 3600;
-const PROCESSING_LOCK_MS = 45_000;
-
-/* ==================================================================
- * WEBHOOK CONFIG  —  edit this block, then deploy
- *
- * Everything the setup needs lives here. Run the admin route once and the
- * generated keys are written to KV; after that this block is only read for
- * the REST credentials.
- * ================================================================== */
-
-const CYBS = {
-  // Production. Test would be apitest.cybersource.com.
-  host: "api.cybersource.com",
-
-  organizationId: "00160868772566001",
-
-  // REST - Shared Secret pair from Business Center > Key Management.
-  restKeyId: "0faae9c1-8a69-471b-b623-c452f988ca0e",
-  restSecret: "+3zXu2rMoylOjxvuJIOQrRutWwylP1LG5fgg+WKOC3o=",
-
-  webhookUrl:
-    "https://bae-api-proxy.z-kulaghsi.workers.dev/webhooks/cybersource",
-  healthUrl: "https://bae-api-proxy.z-kulaghsi.workers.dev/webhooks/health",
-
-  productId: "unifiedCheckout",
-  eventTypes: ["uc.orders.transactionresults"],
-
-  /**
-   * CHANGE THIS before deploying, and change it again when you are done.
-   * It is the only thing standing between the public internet and a route
-   * that can read your REST credentials. Delete the admin route entirely
-   * once setup is finished.
-   */
-  // Existing subscription, used by the `scope` step below.
-  webhookId: "599eb4fa-3e93-0133-e063-8e588e0ab239",
-
-  setupToken: "YlBGcEU3ZDExVG43cThNUXhadzM",
-};
-
-/**
- * CyberSource TEST environment (apitest.cybersource.com). Used only when the
- * BIN Lookup section is set to "Test". Fill in a sandbox merchant's REST
- * shared-secret key to enable it. The production key above is never used
- * for test, and these test values are never used for production.
- */
-const CYBS_TEST = {
-  host: "apitest.cybersource.com",
-  organizationId: "", // sandbox merchant ID
-  restKeyId: "", // sandbox REST key ID
-  restSecret: "", // sandbox REST shared secret
-};
-
-// The reference validator in the CyberSource guide uses a 60-minute window.
-// Tighter is better in principle, but matching their reference avoids
-// rejecting valid notifications over clock skew.
-
-// The reference validator in the CyberSource guide uses a 60-minute window.
-// Tighter is better in principle, but matching their reference avoids
-// rejecting valid notifications during clock skew.
-const SIGNATURE_TOLERANCE_MS = 60 * 60 * 1000;
-
-// Longer than RECORD_TTL_SECONDS on purpose: a late webhook arriving after
-// the payment record expired is exactly the case worth catching.
-const INDEX_TTL_SECONDS = 86_400;
-
-/* ==================================================================
- * Storage
- * ================================================================== */
-
-const memoryStore = new Map();
-
-function store(env) {
-  if (env && env.PAYMENTS) {
-    return {
-      backend: "kv",
-      get: (key) => env.PAYMENTS.get(key, "json"),
-      put: (key, value) =>
-        env.PAYMENTS.put(key, JSON.stringify(value), {
-          expirationTtl: RECORD_TTL_SECONDS,
-        }),
-    };
-  }
-  return {
-    backend: "memory",
-    async get(key) {
-      const hit = memoryStore.get(key);
-      if (!hit) return null;
-      if (hit.expires < Date.now()) {
-        memoryStore.delete(key);
-        return null;
-      }
-      return hit.value;
-    },
-    async put(key, value) {
-      memoryStore.set(key, {
-        value,
-        expires: Date.now() + RECORD_TTL_SECONDS * 1000,
-      });
-    },
-  };
-}
-
-/* ==================================================================
- * CORS
- * ================================================================== */
-
-function corsHeaders(request) {
-  const origin = request.headers.get("Origin") || "";
-  const headers = {
-    Vary: "Origin",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Admin-Token",
-    "Access-Control-Max-Age": "86400",
-  };
-  if (ALLOW_ANY_ORIGIN) {
-    headers["Access-Control-Allow-Origin"] = origin || "*";
-  } else if (ALLOWED_ORIGINS.includes(origin)) {
-    headers["Access-Control-Allow-Origin"] = origin;
-  }
-  return headers;
-}
-
-function json(body, status, request) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store",
-      ...corsHeaders(request),
-    },
-  });
-}
-
-/* ==================================================================
- * Helpers
- * ================================================================== */
-
-function base64UrlDecode(segment) {
-  let b64 = segment.replace(/-/g, "+").replace(/_/g, "/");
-  while (b64.length % 4) b64 += "=";
-  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
-}
-
-/**
- * BAE returns either a bare JWT (withDecode:false) or JSON (withDecode:true).
- * Normalise both so the browser never hand-rolls JWT parsing.
- */
-function normalizeCaptureContext(raw) {
-  const text = raw.trim();
-  let token = null;
-  let jsonLibrary = null;
-  let jsonIntegrity = null;
-
-  let parsed = null;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    /* bare JWT */
-  }
-
-  if (parsed && typeof parsed === "object") {
-    token = parsed.token || parsed.captureContext || null;
-    jsonLibrary = parsed.clientLibrary || null;
-    jsonIntegrity = parsed.clientLibraryIntegrity || null;
-  } else if (typeof parsed === "string") {
-    token = parsed;
-  } else {
-    token = text.replace(/^"|"$/g, "");
-  }
-
-  // Read the copy embedded in the token itself.
-  let jwtLibrary = null;
-  let jwtIntegrity = null;
-  let allowedPaymentTypes = null;
-  if (token && token.split(".").length >= 2) {
-    try {
-      const payload = JSON.parse(base64UrlDecode(token.split(".")[1]));
-      const data = payload?.ctx?.[0]?.data;
-      if (data) {
-        jwtLibrary = data.clientLibrary || null;
-        jwtIntegrity = data.clientLibraryIntegrity || null;
-        allowedPaymentTypes = data.allowedPaymentTypes || null;
-      }
-    } catch {
-      /* surfaced as unexpected_capture_context_shape below */
-    }
-  }
-
-  /**
-   * Always prefer the JWT-embedded library. It is guaranteed to be the build
-   * this specific token was minted for; the top-level JSON field is a
-   * separate value that can drift. Loading a mismatched SDK produces a
-   * generic "An error occurred whilst attempting to complete the
-   * transaction" at up.complete(). This is what the original code did.
-   * The integrity hash must travel with whichever URL wins.
-   */
-  const clientLibrary = jwtLibrary || jsonLibrary;
-  const clientLibraryIntegrity = jwtLibrary ? jwtIntegrity : jsonIntegrity;
-
-  return {
-    token,
-    clientLibrary,
-    clientLibraryIntegrity,
-    allowedPaymentTypes,
-    sdkSource: jwtLibrary ? "jwt" : "json",
-    sdkMismatch: Boolean(
-      jwtLibrary && jsonLibrary && jwtLibrary !== jsonLibrary,
-    ),
-    jsonLibrary,
-    jwtLibrary,
-  };
-}
-
-function amountIsSane(value) {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 && n < 100000;
-}
-
-// BAE-path targetOrigins when the page sends none (older pages, Expo app).
-const DEFAULT_BAE_TARGET_ORIGINS = ["https://ziadqula28.github.io"];
-
-/**
- * body.targetOrigins: optional array of origins, passed to BAE unchanged
- * (same order, no dedupe). Each entry must already be a bare origin,
- * scheme://host[:port] with no path or trailing slash, because the SDK
- * compares origins exactly. Returns { origins } or { error, bad }.
- */
-function parseTargetOrigins(value) {
-  if (value === undefined || value === null) {
-    return { origins: [...DEFAULT_BAE_TARGET_ORIGINS] };
-  }
-  if (!Array.isArray(value) || value.length === 0) {
-    return { error: "targetOrigins must be a non-empty array of origins", bad: [value] };
-  }
-  const bad = value.filter((o) => {
-    if (typeof o !== "string") return true;
-    try {
-      const u = new URL(o);
-      return !(u.protocol === "https:" || u.protocol === "http:") || u.origin !== o;
-    } catch {
-      return true;
-    }
-  });
-  if (bad.length) {
-    return { error: "not a bare origin like https://host[:port]", bad };
-  }
-  return { origins: [...value] };
-}
-
-/* ==================================================================
- * Webhooks: setup state
- *
- * The admin route writes generated keys here. Deliberately NOT using
- * store(), because store() attaches an expiry to everything and these
- * values must outlive every payment record.
- * ================================================================== */
-
-const SETUP_KEY = "cfg:webhook";
-let cachedSetup = null;
-
-async function loadSetup(env) {
-  if (cachedSetup) return cachedSetup;
-  if (!env?.PAYMENTS) return {};
-  cachedSetup = (await env.PAYMENTS.get(SETUP_KEY, "json")) || {};
-  return cachedSetup;
-}
-
-async function saveSetup(env, patch) {
-  const merged = { ...(await loadSetup(env)), ...patch, updatedAt: Date.now() };
-  await env.PAYMENTS.put(SETUP_KEY, JSON.stringify(merged)); // no TTL
-  cachedSetup = merged;
-  return merged;
-}
-
-/* ==================================================================
- * Webhooks: byte helpers
- * ================================================================== */
-
-function b64ToBytes(b64) {
-  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-}
-
-function bytesToB64(bytes) {
-  let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s);
-}
-
-function b64uToBytes(s) {
-  let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
-  while (b64.length % 4) b64 += "=";
-  return b64ToBytes(b64);
-}
-
-/* ==================================================================
- * Webhooks: signature verification
- * ================================================================== */
-
-/** v-c-signature: t=<epoch-ms>;keyId=<uuid>;sig=<base64> */
-function parseSignatureHeader(header) {
-  const out = {};
-  for (const part of String(header || "").split(";")) {
-    const eq = part.indexOf("=");
-    if (eq === -1) continue;
-    // Split on the FIRST '=' only. The sig value is base64 and usually ends
-    // in '=' padding — splitting on every '=' silently truncates it, which
-    // looks identical to having the wrong key.
-    out[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
-  }
-  return { t: out.t, keyId: out.keyId, sig: out.sig };
-}
-
-function constantTimeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-
-async function hmacB64(secretB64, message) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    b64ToBytes(secretB64), // the key is base64 — decode before using it
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const mac = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(message),
-  );
-  return bytesToB64(new Uint8Array(mac));
-}
-
-/**
- * The docs are ambiguous about what exactly gets signed once message-level
- * encryption is on. The prose says "the payload from the body of the
- * notification"; the Java reference sample signs a variable literally named
- * "this is a decrypted payload". Rather than guess, try each candidate and
- * log which one won — the first real notification settles it permanently.
- *
- * `candidates` is [label, string] pairs.
- */
-async function verifyAgainstCandidates(signatureHeader, candidates, env) {
-  const { t, keyId, sig } = parseSignatureHeader(signatureHeader);
-  if (!t || !sig) return { ok: false, reason: "malformed_signature_header" };
-
-  const age = Date.now() - Number(t);
-  if (!Number.isFinite(age) || Math.abs(age) > SIGNATURE_TOLERANCE_MS) {
-    return { ok: false, reason: "stale_timestamp", ageMs: age };
-  }
-
-  const setup = await loadSetup(env);
-  const expectedKeyId = setup.sigKeyId || env.CYBS_WEBHOOK_KEY_ID;
-  const secret = setup.sigKey || env.CYBS_WEBHOOK_SECRET;
-
-  if (expectedKeyId && keyId && keyId !== expectedKeyId) {
-    return {
-      ok: false,
-      reason: "unknown_key_id",
-      keyId,
-      expected: expectedKeyId,
-    };
-  }
-
-  if (!secret) return { ok: false, reason: "signature_key_not_configured" };
-
-  for (const [label, message] of candidates) {
-    if (typeof message !== "string") continue;
-    const computed = await hmacB64(secret, `${t}.${message}`);
-    if (constantTimeEqual(computed, sig)) return { ok: true, matched: label };
-  }
-
-  return {
-    ok: false,
-    reason: "signature_mismatch",
-    tried: candidates.map((c) => c[0]),
-  };
-}
-
-/* ==================================================================
- * Webhooks: message-level encryption (JWE)
- *
- * Real Unified Checkout notifications are encrypted with the MLE public key
- * registered for this org under the "nrtd" tenant. The JWE header names that
- * key ("kid"), so private keys are kept in KV keyed by keyId.
- * ================================================================== */
-
-let cachedMleKeys = {}; // keyId -> CryptoKey, per isolate
-
-// Reads setup straight from KV. A warm isolate can hold setup state from
-// before a new key was registered, which would leave a fresh notification
-// undecryptable until the isolate is recycled.
-async function loadSetupFresh(env) {
-  if (!env?.PAYMENTS) return {};
-  cachedSetup = (await env.PAYMENTS.get(SETUP_KEY, "json")) || {};
-  return cachedSetup;
-}
-
-async function mlePrivateKey(env, kid) {
-  const cacheKey = kid || "_default";
-  if (cachedMleKeys[cacheKey]) return cachedMleKeys[cacheKey];
-
-  // "RSA-OAEP-256" in JWE means RSA-OAEP with SHA-256. Plain "RSA-OAEP" in
-  // WebCrypto defaults to SHA-1; getting this wrong throws a bare
-  // OperationError with no explanation.
-  const alg = { name: "RSA-OAEP", hash: "SHA-256" };
-
-  let setup = await loadSetup(env);
-  if (kid && !setup.mleKeys?.[kid]) setup = await loadSetupFresh(env);
-
-  if (kid && !setup.mleKeys?.[kid]) {
-    console.error(
-      "webhook: no private key stored for kid",
-      kid,
-      "- falling back to",
-      setup.mleKeyId || "none",
-    );
-  }
-
-  const jwk = (kid && setup.mleKeys?.[kid]) || setup.mleJwk;
-  if (jwk) {
-    const key = await crypto.subtle.importKey("jwk", jwk, alg, false, [
-      "decrypt",
-    ]);
-    cachedMleKeys[cacheKey] = key;
-    return key;
-  }
-
-  // Fallback: a PEM supplied as a Worker secret, if the keypair is ever
-  // generated outside this Worker.
-  if (env.CYBS_MLE_PRIVATE_KEY) {
-    const der = b64ToBytes(
-      env.CYBS_MLE_PRIVATE_KEY.replace(
-        /-----(BEGIN|END)[^-]*-----/g,
-        "",
-      ).replace(/\s+/g, ""),
-    );
-    const key = await crypto.subtle.importKey("pkcs8", der, alg, false, [
-      "decrypt",
-    ]);
-    cachedMleKeys[cacheKey] = key;
-    return key;
-  }
-
-  throw new Error("MLE private key not configured - run step=mlecert");
-}
-
-/** Compact JWE: protectedHeader.encryptedKey.iv.ciphertext.tag */
-async function decryptJwe(compact, env) {
-  const parts = compact.split(".");
-  if (parts.length !== 5) throw new Error("not_a_compact_jwe");
-
-  const [protectedB64u, encKeyB64u, ivB64u, ctB64u, tagB64u] = parts;
-  const header = JSON.parse(
-    new TextDecoder().decode(b64uToBytes(protectedB64u)),
-  );
-
-  if (header.alg !== "RSA-OAEP-256" || header.enc !== "A256GCM") {
-    throw new Error(`unsupported_jwe:${header.alg}/${header.enc}`);
-  }
-
-  console.log("webhook: JWE kid", header.kid || "none");
-
-  const cek = await crypto.subtle.decrypt(
-    { name: "RSA-OAEP" },
-    await mlePrivateKey(env, header.kid),
-    b64uToBytes(encKeyB64u),
-  );
-
-  const aesKey = await crypto.subtle.importKey(
-    "raw",
-    cek,
-    { name: "AES-GCM" },
-    false,
-    ["decrypt"],
-  );
-
-  // WebCrypto wants ciphertext and auth tag as one buffer; JWE ships them as
-  // separate segments.
-  const ct = b64uToBytes(ctB64u);
-  const tag = b64uToBytes(tagB64u);
-  const joined = new Uint8Array(ct.length + tag.length);
-  joined.set(ct);
-  joined.set(tag, ct.length);
-
-  const plain = await crypto.subtle.decrypt(
-    {
-      name: "AES-GCM",
-      iv: b64uToBytes(ivB64u),
-      // AAD is the ASCII bytes of the protected header exactly as transmitted.
-      additionalData: new TextEncoder().encode(protectedB64u),
-      tagLength: 128,
-    },
-    aesKey,
-    joined,
-  );
-
-  return new TextDecoder().decode(plain);
-}
-
-/* ==================================================================
- * Webhooks: payload normalisation
- * ================================================================== */
-
-/**
- * Unified Checkout nests the result under payload.details; other products use
- * payload.transactionResult. Flatten both into one shape.
- */
-function normalizeEvent(payload) {
-  // Real UC notifications carry payload.transactionResult, with the full
-  // payment response under .details and a summary (id, status, outcome) on
-  // transactionResult itself.
-  const tr = payload?.transactionResult;
-  const d =
-    tr?.details || payload?.details || tr || payload?.data || payload || {};
-  const amounts = d.orderInformation?.amountDetails || {};
-  return {
-    transactionId: d.id || tr?.id || null,
-    status: d.status || tr?.status || null,
-    outcome: tr?.outcome || null,
-    responseCode: d.processorInformation?.responseCode || null,
-    approvalCode: d.processorInformation?.approvalCode || null,
-    authorizedAmount: amounts.authorizedAmount || amounts.totalAmount || null,
-    currency: amounts.currency || null,
-    reconciliationId: d.reconciliationId || null,
-    clientReferenceCode: d.clientReferenceInformation?.code || null,
-    submitTimeUtc: d.submitTimeUtc || null,
-  };
-}
-
-/**
- * The rule that already held up in production: the top-level `status` field is
- * not the authoritative outcome. An approval needs a processor response code,
- * an approval code, and an authorized amount matching what the capture context
- * was minted for.
- *
- * Number() rather than string comparison, so JOD's three decimals ("1.000" vs
- * "1.00") don't produce a false mismatch.
- */
-function isApproved(evt, record) {
-  if (evt.responseCode !== "00" && evt.responseCode !== "000") return false;
-  if (!evt.approvalCode) return false;
-  if (!record?.totalAmount || !evt.authorizedAmount) return false;
-  return Number(evt.authorizedAmount) === Number(record.totalAmount);
-}
-
-/**
- * Called from handleProcessPayment. Without this index the webhook arrives
- * carrying a CyberSource transaction id that maps to nothing on our side and
- * every notification files as an orphan.
- */
-async function indexTransaction(env, gatewayResponse, reference) {
-  const txnId =
-    gatewayResponse?.id ||
-    gatewayResponse?.transactionId ||
-    gatewayResponse?.details?.id ||
-    gatewayResponse?.transactionResult?.id;
-
-  if (!txnId || !reference) {
-    console.log(
-      "indexTransaction: no transaction id in gateway response — webhooks will orphan.",
-      "Keys present:",
-      gatewayResponse ? Object.keys(gatewayResponse).join(",") : "none",
-    );
-    return;
-  }
-
-  if (env?.PAYMENTS) {
-    await env.PAYMENTS.put(`txn:${txnId}`, reference, {
-      expirationTtl: INDEX_TTL_SECONDS,
-    });
-  }
-  console.log("indexed txn", txnId, "→", reference);
-}
-
-/* ==================================================================
- * Route: webhook health check
- * ================================================================== */
-
-async function handleWebhookHealth() {
-  // Must be fast and unconditional. CyberSource pings this to decide whether
-  // the subscription goes ACTIVE, and keeps polling it afterwards — a flaky
-  // response here moves the subscription to SUSPENDED and withholds events.
-  return new Response(JSON.stringify({ status: "OK", ts: Date.now() }), {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store",
-    },
-  });
-}
-
-/* ==================================================================
- * Route: webhook receiver
- * ================================================================== */
-
-// Real UC notifications arrive as {"encData":"<compact JWE>"}, which decrypts
-// to the whole notification. Older docs show an encrypted string in
-// "payload" instead. Test notifications are plain JSON.
-function encryptedPart(envelope) {
-  if (typeof envelope?.encData === "string") return envelope.encData;
-  if (typeof envelope?.payload === "string") return envelope.payload;
-  return null;
-}
-
-async function handleWebhook(request, env, ctx) {
-  const rawBody = await request.text();
-
-  console.log(
-    "webhook ←",
-    request.headers.get("v-c-event-type"),
-    "retry=" + request.headers.get("v-c-retry-count"),
-    "trace=" + request.headers.get("v-c-transaction-trace-id"),
-    "mleKey=" + (request.headers.get("v-c-key-id") || "none"),
-    "bytes=" + rawBody.length,
-  );
-
-  let envelope = null;
-  try {
-    envelope = JSON.parse(rawBody);
-  } catch {
-    console.error("webhook: body is not JSON");
-    return new Response(JSON.stringify({ error: "invalid_json" }), {
-      status: 400,
-    });
-  }
-
-  const encrypted = encryptedPart(envelope);
-
-  // The signature may cover the raw body or the decrypted content; try both
-  // and log which one matches.
-  const candidates = [
-    ["rawBody", rawBody],
-    ["encryptedField", encrypted],
-  ];
-
-  // Decrypting before verifying is safe here: a forged JWE fails the RSA/GCM
-  // check and throws rather than yielding attacker-controlled plaintext.
-  let decrypted = null;
-  if (encrypted && !encrypted.startsWith("{CBC}")) {
-    try {
-      decrypted = await decryptJwe(encrypted, env);
-      candidates.push(["decrypted", decrypted]);
-      console.log("webhook: decrypted OK");
-    } catch (err) {
-      console.error("webhook: decrypt failed —", err.message);
-    }
-  }
-
-  const verdict = await verifyAgainstCandidates(
-    request.headers.get("v-c-signature"),
-    candidates.filter(([, v]) => typeof v === "string"),
-    env,
-  );
-
-  if (!verdict.ok) {
-    // 401 rather than a silent 200. Accepting an unverified notification is
-    // exactly the hole the signature exists to close.
-    console.error("webhook REJECTED:", JSON.stringify(verdict));
-    return new Response(JSON.stringify({ error: verdict.reason }), {
-      status: 401,
-    });
-  }
-
-  console.log("webhook signature OK — matched candidate:", verdict.matched);
-
-  // Answer fast, work afterwards. A slow handler becomes a retry, which
-  // becomes a duplicate.
-  ctx.waitUntil(processNotification(envelope, decrypted, env));
-  return new Response(JSON.stringify({ received: true }), { status: 200 });
-}
-
-async function processNotification(envelope, decrypted, env) {
-  const db = store(env);
-  const encrypted = encryptedPart(envelope);
-
-  // `event` is the notification with eventType, productId,
-  // transactionTraceId and payload, whichever wire format it arrived in.
-  let event = envelope;
-
-  if (encrypted) {
-    if (encrypted.startsWith("{CBC}")) {
-      console.error(
-        "webhook: {CBC} envelope — different encryption scheme, not handled",
-      );
-      return;
-    }
-    if (!decrypted) {
-      // Keep the ciphertext so it can be decrypted later once the key
-      // problem is fixed, instead of losing the payment outcome.
-      const keepKey = `undecrypted:${Date.now()}`;
-      await db.put(keepKey, { encrypted, receivedAt: Date.now() });
-      console.error("webhook: encrypted but undecryptable — kept as", keepKey);
-      return;
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(decrypted);
-    } catch {
-      console.error("webhook: decrypted content is not JSON");
-      return;
-    }
-    event =
-      typeof envelope.encData === "string"
-        ? parsed
-        : { ...envelope, payload: parsed };
-  }
-
-  // Idempotency. Retries are normal operation, not an exception.
-  const traceId = event.transactionTraceId || envelope.transactionTraceId;
-  const eventKey = `evt:${traceId || ""}`;
-  if (traceId && (await db.get(eventKey))) {
-    console.log("webhook: duplicate trace", traceId);
-    return;
-  }
-
-  const evt = normalizeEvent(event.payload);
-  console.log(
-    "webhook event:",
-    event.productId,
-    event.eventType,
-    "txn=" + evt.transactionId,
-    "status=" + evt.status,
-    "rc=" + evt.responseCode,
-    "amount=" + evt.authorizedAmount + " " + evt.currency,
-    "ref=" + evt.clientReferenceCode,
-  );
-
-  // Use the merchant reference only if it is one of ours. On the BAE path it
-  // is BAE's own timestamp, so fall back to the transaction-id link written
-  // when the browser reported the verified complete() result.
-  let reference = null;
-  if (
-    evt.clientReferenceCode &&
-    (await db.get(`pay:${evt.clientReferenceCode}`))
-  ) {
-    reference = evt.clientReferenceCode;
-  }
-  if (!reference && evt.transactionId && env?.PAYMENTS) {
-    reference = await env.PAYMENTS.get(`txn:${evt.transactionId}`);
-  }
-
-  if (!reference) {
-    // Not a failure. Either the browser has not reported yet (the webhook can
-    // arrive first), or it never will (tab closed). Park it; the browser's
-    // report settles it on arrival.
-    await db.put(`orphan:${evt.transactionId || Date.now()}`, {
-      source: "webhook",
-      productId: event.productId,
-      eventType: event.eventType,
-      event: evt,
-      receivedAt: Date.now(),
-    });
-    console.log(
-      "webhook: ORPHAN — no payment record for txn",
-      evt.transactionId,
-      "ref",
-      evt.clientReferenceCode,
-    );
-    if (traceId) await db.put(eventKey, { seen: Date.now() });
-    return;
-  }
-
-  const outcome = await settleFromWebhook(env, reference, evt, event.eventType);
-  if (traceId) await db.put(eventKey, { seen: Date.now() });
-  console.log("webhook: settled", reference, outcome);
-}
-
-/**
- * Applies a verified webhook result to a payment record. The webhook is the
- * authoritative channel: it overrides whatever the browser reported, except
- * that a captured authorization is never downgraded.
- */
-async function settleFromWebhook(env, reference, evt, eventType) {
-  const db = store(env);
-  const key = `pay:${reference}`;
-  const record = await db.get(key);
-  if (!record) return null;
-
-  const approved = isApproved(evt, record);
-  const held = approved && record.captureMode === "auth";
-  const outcome = !approved
-    ? "DECLINED"
-    : held
-      ? "AUTHORIZED_HELD"
-      : "COMPLETED";
-
-  const browserApproved =
-    record.browserResult?.status === "AUTHORIZED" ||
-    record.browserResult?.status === "COMPLETED";
-
-  await db.put(key, {
-    ...record,
-    status: record.status === "CAPTURED" ? "CAPTURED" : outcome,
-    confirmedBy: "webhook",
-    // The webhook is a trustworthy source for the auth id a capture needs.
-    authTransactionId:
-      record.authTransactionId || (held ? evt.transactionId : null) || null,
-    webhook: {
-      transactionId: evt.transactionId,
-      gatewayStatus: evt.status,
-      outcome: evt.outcome,
-      responseCode: evt.responseCode,
-      approvalCode: evt.approvalCode,
-      authorizedAmount: evt.authorizedAmount,
-      currency: evt.currency,
-      reconciliationId: evt.reconciliationId,
-      eventType,
-      receivedAt: Date.now(),
-    },
-    // Surface disagreement rather than hiding it — two channels reaching
-    // different conclusions about one payment is a real signal.
-    channelMismatch:
-      Boolean(record.browserResult) && browserApproved !== approved,
-    updatedAt: Date.now(),
-  });
-  return outcome;
-}
-
-/* ==================================================================
- * Completion result: the signed JWT returned by up.complete()
- *
- * The browser reports it so the transaction id can be linked to our
- * reference. That matters on the BAE path, where the reference inside the
- * payment is overwritten with BAE's own timestamp. The link is only written
- * when CyberSource's signature verifies, so a browser cannot attach someone
- * else's payment to its order.
- * ================================================================== */
-
-function b64uJson(seg) {
-  return JSON.parse(new TextDecoder().decode(b64uToBytes(seg)));
-}
-
-// The capture context carries a public key (flx.jwk). It is kept on the
-// payment record so the completion result can be checked against it.
-function captureContextJwk(token) {
-  try {
-    const payload = b64uJson(String(token).split(".")[1]);
-    return payload?.flx?.jwk || null;
-  } catch {
-    return null;
-  }
-}
-
-const publicKeyCache = {}; // kid -> JWK, per isolate
-
-async function fetchCybsPublicKey(env, kid) {
-  if (publicKeyCache[kid]) return publicKeyCache[kid];
-  const stored = env?.PAYMENTS
-    ? await env.PAYMENTS.get(`pubkey:${kid}`, "json")
-    : null;
-  if (stored) return (publicKeyCache[kid] = stored);
-
-  const r = await cybsCall(
-    "GET",
-    `/flex/v2/public-keys/${encodeURIComponent(kid)}`,
-  );
-  if (!r.ok || !r.body?.n) {
-    console.log(
-      "public key fetch",
-      kid,
-      "→",
-      r.status,
-      String(r.raw || "").slice(0, 200),
-    );
-    return null;
-  }
-  if (env?.PAYMENTS) {
-    await env.PAYMENTS.put(`pubkey:${kid}`, JSON.stringify(r.body), {
-      expirationTtl: 7 * 86400,
-    });
-  }
-  return (publicKeyCache[kid] = r.body);
-}
-
-async function verifyRs256(token, jwk) {
-  const [h, p, sig] = token.split(".");
-  const key = await crypto.subtle.importKey(
-    "jwk",
-    { kty: "RSA", n: jwk.n, e: jwk.e, ext: true },
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["verify"],
-  );
-  return crypto.subtle.verify(
-    "RSASSA-PKCS1-v1_5",
-    key,
-    b64uToBytes(sig),
-    new TextEncoder().encode(`${h}.${p}`),
-  );
-}
-
-/** Decodes the complete() result and checks CyberSource's signature. */
-async function readCompleteResult(env, result, record) {
-  if (result && typeof result === "object") {
-    return { payload: result, verified: false, reason: "not_a_jwt" };
-  }
-  const token = String(result || "")
-    .trim()
-    .replace(/^"|"$/g, "");
-  const parts = token.split(".");
-  if (parts.length !== 3)
-    return { payload: null, verified: false, reason: "not_a_jwt" };
-
-  let header;
-  let payload;
-  try {
-    header = b64uJson(parts[0]);
-    payload = b64uJson(parts[1]);
-  } catch {
-    return { payload: null, verified: false, reason: "undecodable" };
-  }
-  if (header.alg !== "RS256") {
-    return { payload, header, verified: false, reason: "alg_" + header.alg };
-  }
-  if (payload.exp && payload.exp * 1000 < Date.now() - 5 * 60 * 1000) {
-    return { payload, header, verified: false, reason: "expired" };
-  }
-
-  const tried = [];
-  const ccJwk = record?.flxJwk;
-  if (ccJwk?.n && (!ccJwk.kid || ccJwk.kid === header.kid)) {
-    tried.push("captureContext");
-    try {
-      if (await verifyRs256(token, ccJwk)) {
-        return { payload, header, verified: true, method: "captureContext" };
-      }
-    } catch {
-      /* fall through to the public key endpoint */
-    }
-  }
-  if (header.kid) {
-    tried.push("publicKeyEndpoint");
-    const jwk = await fetchCybsPublicKey(env, header.kid);
-    if (jwk) {
-      try {
-        if (await verifyRs256(token, jwk)) {
-          return {
-            payload,
-            header,
-            verified: true,
-            method: "publicKeyEndpoint",
-          };
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BAE Unified Checkout – 3DS resilience harness</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script
+      defer
+      src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"
+    ></script>
+  </head>
+  <body class="bg-gray-50 font-sans text-gray-900" x-data="harness()">
+    <nav class="bg-white border-b border-gray-200 p-4 sticky top-0 z-50">
+      <div
+        class="max-w-5xl mx-auto flex flex-wrap justify-between items-center gap-4"
+      >
+        <h1 class="text-xl font-bold italic">Payments+</h1>
+
+        <div class="flex items-center gap-3">
+          <button
+            @click="environment = environment === 'prod' ? 'dev' : environment === 'dev' ? 'cybersource' : 'prod'"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white"
+            :class="environment === 'prod' ? 'bg-green-600' : environment === 'dev' ? 'bg-blue-600' : 'bg-purple-600'"
+            x-text="environment === 'cybersource' ? 'CYBS' : environment.toUpperCase()"
+          ></button>
+          <button
+            @click="currency = currency === 'JOD' ? 'USD' : 'JOD'"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white bg-gray-800"
+            x-text="currency"
+          ></button>
+          <!-- Merchant: main account or the sub-account (BAE path only) -->
+          <button
+            x-show="environment !== 'cybersource'"
+            @click="merchant = merchant === 'main' ? 'sub' : 'main'"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white"
+            :class="merchant === 'sub' ? 'bg-teal-700' : 'bg-gray-800'"
+            :title="merchant === 'sub' ? 'Uses the sub-account key (Worker secret)' : 'Uses the main account key'"
+            x-text="merchant === 'sub' ? 'MERCHANT SUB' : 'MERCHANT MAIN'"
+          ></button>
+          <!-- AUTH vs CAPTURE toggle: only meaningful on the direct CYBS path -->
+          <button
+            x-show="environment === 'cybersource'"
+            @click="captureMode = captureMode === 'capture' ? 'auth' : 'capture'"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white"
+            :class="captureMode === 'auth' ? 'bg-amber-600' : 'bg-gray-800'"
+            :title="captureMode === 'auth' ? 'Authorize only (hold funds)' : 'Authorize + Capture (sale)'"
+            x-text="captureMode === 'auth' ? 'PRE-AUTH' : 'CAPTURE'"
+          ></button>
+          <!-- Apple Pay on/off: sets allowedPaymentTypes for the session (CYBS path only) -->
+          <button
+            x-show="environment === 'cybersource'"
+            @click="applePayOn = !applePayOn"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white"
+            :class="applePayOn ? 'bg-gray-800' : 'bg-red-700'"
+            :title="applePayOn ? 'Session offers card, Apple Pay, Google Pay' : 'Session offers card and Google Pay only'"
+            x-text="applePayOn ? 'APPLE PAY ON' : 'APPLE PAY OFF'"
+          ></button>
+          <!-- Save card (TMS): offer "Save payment information" in the checkout (CYBS path only) -->
+          <button
+            x-show="environment === 'cybersource'"
+            @click="saveCard = !saveCard"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white"
+            :class="saveCard ? 'bg-emerald-700' : 'bg-gray-800'"
+            :title="saveCard ? 'Checkout offers to save the card (TMS token)' : 'Card is not saved'"
+            x-text="saveCard ? 'SAVE CARD ON' : 'SAVE CARD OFF'"
+          ></button>
+          <label
+            class="flex items-center gap-2 text-xs font-medium text-gray-600"
+          >
+            <input
+              type="checkbox"
+              x-model="forceManualConfirm"
+              class="accent-blue-600"
+            />
+            Force confirm step
+          </label>
+          <!-- Payment tools page: void / refund / charge saved card / look up -->
+          <button
+            @click="step === 'tools' ? (step = 'shop') : openTools()"
+            class="px-3 py-1.5 rounded-full text-[11px] font-bold tracking-widest text-white bg-indigo-700"
+            x-text="step === 'tools' ? 'CLOSE TOOLS' : 'TOOLS'"
+          ></button>
+        </div>
+      </div>
+    </nav>
+
+    <main class="max-w-5xl mx-auto py-10 px-6">
+      <!-- =========================================================
+           PAYMENT TOOLS: act on any CyberSource transaction directly
+           (CYBS path, worker REST key). Needs CYBS_ADMIN_TOKEN.
+           ========================================================= -->
+      <section x-show="step === 'tools'" class="max-w-xl mx-auto" style="display: none">
+        <button @click="step = 'shop'" class="text-gray-400 mb-4 text-sm hover:text-black">
+          ← Back to shop
+        </button>
+        <div class="bg-white p-6 sm:p-8 rounded-3xl shadow-sm border border-gray-200">
+          <h2 class="text-2xl font-black">Payment tools</h2>
+          <p class="text-sm text-gray-500 mt-1">
+            Void, refund, charge a saved card, or look up any transaction. These call
+            CyberSource directly with the worker's REST key, and need the admin token.
+          </p>
+
+          <label class="block text-xs font-semibold text-gray-500 mt-4">Transaction ID (Request ID)</label>
+          <input x-model.trim="toolTxn" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm" placeholder="e.g. 7933412148216689903092" />
+
+          <div class="flex gap-3">
+            <div class="flex-1">
+              <label class="block text-xs font-semibold text-gray-500 mt-4">Amount (refund or saved-card charge)</label>
+              <input x-model.trim="toolAmount" type="number" step="0.001" min="0.001" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm" placeholder="0.100" />
+            </div>
+            <div class="w-28">
+              <label class="block text-xs font-semibold text-gray-500 mt-4">Currency</label>
+              <select x-model="toolCurrency" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm">
+                <option>JOD</option>
+                <option>USD</option>
+              </select>
+            </div>
+          </div>
+
+          <label class="block text-xs font-semibold text-gray-500 mt-4">Saved card (customer token)</label>
+          <input x-model.trim="toolCustomer" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm" placeholder="needed only for Charge saved card" />
+
+          <label class="block text-xs font-semibold text-gray-500 mt-4">Admin token</label>
+          <input x-model="adminToken" type="password" autocomplete="off" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm" />
+
+          <div class="flex flex-wrap gap-2 mt-5">
+            <button @click="toolAction('void')" :disabled="toolBusy" class="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-50 bg-gray-800">Void</button>
+            <button @click="toolAction('refund')" :disabled="toolBusy" class="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-50 bg-gray-800">Refund</button>
+            <button @click="toolAction('charge')" :disabled="toolBusy" class="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-50 bg-emerald-700">Charge saved card</button>
+            <button @click="toolAction('lookup')" :disabled="toolBusy" class="px-4 py-2 rounded-xl text-sm font-bold border border-gray-300 disabled:opacity-50">Look up</button>
+          </div>
+
+          <p x-show="toolStatus" x-text="toolStatus" class="text-sm mt-4 font-medium"
+             :class="toolOk ? 'text-green-700' : 'text-red-700'"></p>
+
+          <div x-show="toolHistory.length" class="mt-6">
+            <p class="text-xs font-bold tracking-widest text-gray-500">THIS SESSION</p>
+            <ul class="mt-2 space-y-1 text-xs font-mono text-gray-700">
+              <template x-for="(item, i) in toolHistory" :key="i">
+                <li x-text="item"></li>
+              </template>
+            </ul>
+          </div>
+
+          <div x-show="toolLast" class="mt-6">
+            <p class="text-xs font-bold tracking-widest text-gray-500">LAST RESPONSE</p>
+            <pre x-text="toolLast" class="mt-2 text-[11px] bg-gray-50 border border-gray-200 rounded-xl p-3 overflow-auto max-h-80 whitespace-pre-wrap break-all"></pre>
+          </div>
+        </div>
+
+        <!-- BIN LOOKUP: issuing bank for a card prefix (CyberSource BIN Lookup API).
+             Uses the admin token above. Only the first 6-8 digits are accepted. -->
+        <div class="bg-white p-6 sm:p-8 rounded-3xl shadow-sm border border-gray-200 mt-6">
+          <h2 class="text-2xl font-black">BIN Lookup</h2>
+          <p class="text-sm text-gray-500 mt-1">
+            Find the issuing bank of a card from its first 6 to 8 digits, such as the
+            Account Prefix in the Business Center. Uses the admin token above.
+          </p>
+
+          <div class="flex gap-3">
+            <div class="flex-1">
+              <label for="bin-input" class="block text-xs font-semibold text-gray-500 mt-4">BIN (first 6 to 8 digits)</label>
+              <input id="bin-input" x-model="binInput" @input="binFromTxn = ''" @keydown.enter="lookupBin()" inputmode="numeric" autocomplete="off" maxlength="12" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm" placeholder="e.g. 42992007" />
+            </div>
+            <div class="w-36">
+              <label for="bin-env" class="block text-xs font-semibold text-gray-500 mt-4">Environment</label>
+              <select id="bin-env" x-model="binEnv" class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm">
+                <option value="production">Production</option>
+                <option value="test">Test</option>
+              </select>
+            </div>
+          </div>
+          <p x-show="binFromTxn" x-text="'Filled from transaction ' + binFromTxn" class="text-xs text-gray-500 mt-2"></p>
+
+          <button @click="lookupBin()" :disabled="binBusy" class="mt-5 px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-50 bg-gray-800 inline-flex items-center gap-2">
+            <span x-show="binBusy" class="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+            <span x-text="binBusy ? 'Looking up…' : 'Look up BIN'"></span>
+          </button>
+
+          <p x-show="binError" x-text="binError" role="alert" class="text-sm mt-4 font-medium text-red-700"></p>
+          <p x-show="binNotice" x-text="binNotice" class="text-sm mt-4 font-medium text-amber-700"></p>
+
+          <table x-show="binRows.length" class="w-full mt-5 text-sm">
+            <tbody>
+              <template x-for="row in binRows" :key="row.label">
+                <tr class="border-t border-gray-100">
+                  <th scope="row" x-text="row.label" class="text-left font-semibold text-gray-500 py-2 pr-4 w-40 align-top"></th>
+                  <td x-text="row.value" class="py-2 break-words" :class="row.strong ? 'font-bold' : ''"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+
+          <details x-show="binRaw" class="mt-4">
+            <summary class="text-xs font-bold tracking-widest text-gray-500 cursor-pointer">CYBERSOURCE RESPONSE</summary>
+            <pre x-text="binRaw" class="mt-2 text-[11px] bg-gray-50 border border-gray-200 rounded-xl p-3 overflow-auto max-h-80 whitespace-pre-wrap break-all"></pre>
+          </details>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------ shop -->
+      <section x-show="step === 'shop'">
+        <!-- BAE path only: targetOrigins sent in the capture-context request -->
+        <div x-show="environment !== 'cybersource'" class="mb-6 max-w-xl">
+          <label for="target-origins" class="block text-xs font-semibold text-gray-500">
+            Target origins (BAE path, comma-separated)
+          </label>
+          <input
+            id="target-origins"
+            x-model="targetOriginsInput"
+            @input="originsError = ''"
+            autocomplete="off"
+            spellcheck="false"
+            class="w-full border border-gray-300 rounded-xl px-3 py-2 mt-1 text-sm font-mono"
+          />
+          <p class="text-xs text-gray-500 mt-1">
+            This page's origin: <span class="font-mono" x-text="window.location.origin"></span>
+          </p>
+          <p x-show="originsError" x-text="originsError" role="alert" class="text-xs text-red-700 mt-1"></p>
+        </div>
+        <h2 class="text-2xl font-bold mb-6">Select an amount</h2>
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <template x-for="product in products" :key="product.id">
+            <div
+              class="bg-white p-5 rounded-2xl border border-gray-200 flex flex-col justify-between"
+            >
+              <div>
+                <h3 class="font-bold" x-text="product.name"></h3>
+                <p class="text-gray-500 text-sm mt-1" x-text="product.desc"></p>
+              </div>
+              <div class="mt-6 flex justify-between items-center gap-2">
+                <span
+                  x-show="!product.isCustom"
+                  class="font-black text-lg"
+                  x-text="product.price.toFixed(2)"
+                ></span>
+                <input
+                  x-show="product.isCustom"
+                  type="text"
+                  inputmode="decimal"
+                  autocomplete="off"
+                  x-model="customAmount"
+                  class="w-20 px-2 py-1 border-2 border-gray-200 rounded-lg font-bold focus:border-blue-600 focus:outline-none"
+                />
+                <button
+                  @click="addToCart(product)"
+                  class="bg-black text-white px-4 py-2 rounded-xl text-sm font-bold active:scale-95 transition"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <div
+          x-show="cart.length > 0"
+          class="fixed bottom-6 left-1/2 -translate-x-1/2 bg-white shadow-2xl border border-gray-200 px-6 py-4 rounded-3xl flex items-center gap-6"
+        >
+          <div>
+            <p
+              class="text-[10px] text-gray-400 uppercase font-bold tracking-widest"
+            >
+              Total
+            </p>
+            <span
+              class="font-black text-xl"
+              x-text="totalText + ' ' + currency"
+            ></span>
+          </div>
+          <button
+            @click="startCheckout()"
+            class="bg-blue-600 text-white px-8 py-3 rounded-2xl font-bold hover:bg-blue-700 transition"
+          >
+            Check out
+          </button>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------ checkout -->
+      <section
+        x-show="step === 'checkout'"
+        class="max-w-xl mx-auto"
+        style="display: none"
+      >
+        <button
+          @click="reset()"
+          class="text-gray-400 mb-4 text-sm hover:text-black"
+        >
+          ← Reset and return to shop
+        </button>
+
+        <div
+          class="bg-white p-6 sm:p-8 rounded-3xl shadow-sm border border-gray-200"
+        >
+          <div class="flex items-center gap-2 mb-4">
+            <h2 class="text-2xl font-black">Secure checkout</h2>
+            <span
+              class="text-[10px] font-bold px-2 py-1 rounded tracking-widest text-white"
+              :class="environment === 'prod' ? 'bg-green-600' : environment === 'dev' ? 'bg-blue-600' : 'bg-purple-600'"
+              x-text="environment === 'cybersource' ? 'CYBS' : environment.toUpperCase()"
+            ></span>
+          </div>
+
+          <div class="flex justify-between items-center mb-6 border-b pb-4">
+            <span class="text-gray-500">Amount due</span>
+            <span
+              class="text-xl font-bold"
+              x-text="totalText + ' ' + currency"
+            ></span>
+          </div>
+
+          <!--
+            JWT EXTRACTION BAR
+            Appears as soon as the capture context arrives. The console folds
+            multi-kilobyte single-line strings and the SDK's own logging
+            scrolls them away, so the token is surfaced here instead.
+          -->
+          <div
+            x-show="captureContext"
+            style="display: none"
+            class="mb-4 rounded-2xl border-2 border-amber-300 bg-amber-50 p-3"
+          >
+            <div class="flex items-center justify-between gap-3 flex-wrap">
+              <div class="text-xs">
+                <p class="font-bold text-amber-900">Capture context JWT</p>
+                <p class="text-amber-700 font-mono break-all">
+                  <span
+                    x-text="captureContext ? captureContext.length : 0"
+                  ></span>
+                  chars · <span x-text="jwtMerchantLabel"></span>
+                </p>
+              </div>
+              <div class="flex gap-2">
+                <button
+                  @click="copyJwt()"
+                  class="px-3 py-1.5 rounded-lg bg-amber-600 text-white text-xs font-bold"
+                >
+                  Copy JWT
+                </button>
+                <button
+                  @click="downloadJwt()"
+                  class="px-3 py-1.5 rounded-lg bg-gray-900 text-white text-xs font-bold"
+                >
+                  Download .txt
+                </button>
+                <button
+                  @click="showJwt = !showJwt"
+                  class="px-3 py-1.5 rounded-lg border border-amber-400 text-amber-900 text-xs font-bold"
+                  x-text="showJwt ? 'Hide' : 'Show'"
+                ></button>
+              </div>
+            </div>
+            <textarea
+              x-show="showJwt"
+              style="display: none"
+              readonly
+              @click="$event.target.select()"
+              class="mt-3 w-full h-32 p-2 rounded-lg border border-amber-300 font-mono text-[10px] bg-white"
+              x-text="captureContext"
+            ></textarea>
+          </div>
+
+          <div
+            class="relative min-h-[320px] border border-gray-200 rounded-2xl bg-gray-50 p-3"
+          >
+            <div
+              x-show="loading"
+              class="absolute inset-0 flex flex-col items-center justify-center bg-white/95 z-10 rounded-2xl"
+            >
+              <div
+                class="animate-spin rounded-full h-9 w-9 border-b-2 border-blue-600"
+              ></div>
+              <p
+                class="mt-3 text-sm font-semibold text-gray-600"
+                x-text="loadingMessage"
+              ></p>
+            </div>
+
+            <div id="payment-selection-container" class="w-full"></div>
+            <div id="payment-screen-container" class="w-full"></div>
+          </div>
+
+          <!--
+            CRITICAL (iOS): this button is plain HTML with an inline onclick.
+            No framework, no async wrapper, no state write before up.complete().
+            WebKit only grants pop-up permission inside the same task as the tap.
+          -->
+          <button
+            id="confirm-pay-button"
+            type="button"
+            onclick="window.BaePay.confirmTap()"
+            x-show="phase === 'armed'"
+            style="display: none"
+            class="mt-5 w-full bg-blue-600 text-white py-4 rounded-2xl font-bold text-lg active:scale-[0.99] transition"
+          >
+            Confirm and pay
+            <span x-text="totalText + ' ' + currency"></span>
+          </button>
+
+          <button
+            id="resume-pay-button"
+            type="button"
+            onclick="window.BaePay.resumeTap()"
+            x-show="phase === 'stalled'"
+            style="display: none"
+            class="mt-5 w-full bg-amber-500 text-white py-4 rounded-2xl font-bold text-lg active:scale-[0.99] transition"
+          >
+            Resume verification
+          </button>
+
+          <p
+            x-show="phase === 'stalled'"
+            class="mt-3 text-sm text-amber-700"
+            style="display: none"
+          >
+            The bank's verification window did not report back. Tap resume to
+            check the result.
+          </p>
+        </div>
+
+        <!-- ------------------------------------------------ diagnostics -->
+        <div class="mt-6 bg-white border border-gray-200 rounded-2xl p-5">
+          <div class="flex justify-between items-center mb-3">
+            <h3
+              class="font-bold text-sm uppercase tracking-widest text-gray-500"
+            >
+              Diagnostics
+            </h3>
+            <button @click="copyLog()" class="text-xs font-bold text-blue-600">
+              Copy log
+            </button>
+          </div>
+          <dl class="grid grid-cols-2 gap-y-1 text-xs mb-4">
+            <dt class="text-gray-500">Engine</dt>
+            <dd class="font-mono" x-text="diag.engine"></dd>
+            <dt class="text-gray-500">Pop-up shim</dt>
+            <dd class="font-mono" x-text="diag.shim"></dd>
+            <dt class="text-gray-500">Reference</dt>
+            <dd class="font-mono break-all" x-text="reference || '—'"></dd>
+            <dt class="text-gray-500">Phase</dt>
+            <dd class="font-mono" x-text="phase"></dd>
+            <dt class="text-gray-500">Theme keys in JWT</dt>
+            <dd class="font-mono break-all" x-text="diag.theme"></dd>
+          </dl>
+          <div
+            class="bg-gray-900 text-gray-100 rounded-xl p-3 max-h-64 overflow-auto font-mono text-[11px] leading-relaxed"
+          >
+            <template x-for="line in log" :key="line.id">
+              <div>
+                <span class="text-gray-500" x-text="line.t + 'ms '"></span>
+                <span x-text="line.msg"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      /* =================================================================
+       * CONFIG
+       * ================================================================= */
+      const PROXY_URL = "https://bae-api-proxy.z-kulaghsi.workers.dev";
+
+      /* =================================================================
+       * Environment detection
+       * ================================================================= */
+      const UA = navigator.userAgent;
+      const IS_IOS =
+        /iPad|iPhone|iPod/.test(UA) ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+      /* =================================================================
+       * Pop-up activation shim  (Issue 2)
+       * -----------------------------------------------------------------
+       * WebKit grants window.open() permission only inside the task that
+       * handled the tap. The SDK opens its 3DS window *after* an internal
+       * network round trip, so by then the grant is gone.
+       *
+       * Fix: open a blank window synchronously while we still hold the
+       * grant, then hand that same window to the SDK when it calls
+       * window.open() a moment later.
+       * ================================================================= */
+      function installOpenShim(logger) {
+        const original = window.open;
+        let placeholder = null;
+        let consumed = false;
+
+        try {
+          placeholder = original.call(window, "", "_blank");
+        } catch (e) {
+          placeholder = null;
         }
-      } catch {
-        /* reported below */
-      }
-    }
-  }
-  return {
-    payload,
-    header,
-    verified: false,
-    reason: "signature_not_verified",
-    tried,
-  };
-}
 
-function completeResultFields(payload) {
-  const d = payload?.details || payload || {};
-  const amounts = d.orderInformation?.amountDetails || {};
-  return {
-    transactionId: d.id || payload?.id || null,
-    status: payload?.status || payload?.outcome || d.status || null,
-    responseCode: d.processorInformation?.responseCode || null,
-    amount: amounts.authorizedAmount || amounts.totalAmount || null,
-    currency: amounts.currency || null,
-    clientReferenceCode: d.clientReferenceInformation?.code || null,
-  };
-}
-
-/**
- * Records what the browser saw and, when the result verifies, links the
- * transaction id to our reference. If the webhook already arrived and was
- * parked as an orphan, settles it now.
- */
-async function recordCompleteResult(env, reference, result) {
-  const db = store(env);
-  const key = `pay:${reference}`;
-  const record = reference ? await db.get(key) : null;
-  const read = await readCompleteResult(env, result, record);
-  const f = completeResultFields(read.payload);
-
-  console.log(
-    "complete result ←",
-    reference,
-    "txn=" + f.transactionId,
-    "status=" + f.status,
-    "amount=" + f.amount + " " + f.currency,
-    "verified=" + read.verified,
-    read.method || read.reason,
-    read.tried ? "tried=" + read.tried.join(",") : "",
-  );
-  // Full payload, for checking field names against a real payment.
-  console.log(
-    "complete result payload:",
-    JSON.stringify({
-      header: read.header || null,
-      payload: read.payload,
-    }).slice(0, 3000),
-  );
-
-  let linked = false;
-  let linkNote = null;
-  if (!record) linkNote = "no_payment_record";
-  else if (!read.verified) linkNote = "not_verified";
-  else if (!f.transactionId) linkNote = "no_transaction_id";
-  else if (
-    f.amount != null &&
-    Number(f.amount) !== Number(record.totalAmount)
-  ) {
-    linkNote = "amount_mismatch";
-  } else if (f.currency && record.currency && f.currency !== record.currency) {
-    linkNote = "currency_mismatch";
-  } else {
-    const existing = env?.PAYMENTS
-      ? await env.PAYMENTS.get(`txn:${f.transactionId}`)
-      : null;
-    if (existing && existing !== reference) {
-      linkNote = "already_linked_to_" + existing;
-    } else if (env?.PAYMENTS) {
-      await env.PAYMENTS.put(`txn:${f.transactionId}`, reference, {
-        expirationTtl: INDEX_TTL_SECONDS,
-      });
-      linked = true;
-    }
-  }
-  console.log(
-    "complete result link:",
-    linked ? `txn ${f.transactionId} → ${reference}` : linkNote,
-  );
-
-  // Store the browser's view without overriding a webhook-confirmed status.
-  if (record) {
-    const latest = (await db.get(key)) || record;
-    await db.put(key, {
-      ...latest,
-      browserResult: {
-        status: f.status,
-        transactionId: f.transactionId,
-        verified: read.verified,
-        receivedAt: Date.now(),
-      },
-      authTransactionId:
-        latest.authTransactionId ||
-        (read.verified ? f.transactionId : null) ||
-        null,
-      updatedAt: Date.now(),
-    });
-  }
-
-  let settledNow = null;
-  if (linked) {
-    const orphan = await db.get(`orphan:${f.transactionId}`);
-    if (orphan?.event) {
-      settledNow = await settleFromWebhook(
-        env,
-        reference,
-        orphan.event,
-        orphan.eventType,
-      );
-      if (env?.PAYMENTS?.delete)
-        await env.PAYMENTS.delete(`orphan:${f.transactionId}`);
-      console.log("complete result: settled the waiting webhook →", settledNow);
-    }
-  }
-
-  return { read, fields: f, linked, linkNote, settledNow };
-}
-
-/** BAE path: the browser reports the complete() result here. */
-async function handlePaymentResult(request, env, body) {
-  const { reference, result } = body;
-  if (!reference || !result) {
-    return json({ error: "reference_and_result_required" }, 400, request);
-  }
-  const out = await recordCompleteResult(env, reference, result);
-  const record = await store(env).get(`pay:${reference}`);
-  return json(
-    {
-      reference,
-      transactionId: out.fields.transactionId,
-      browserStatus: out.fields.status,
-      verified: out.read.verified,
-      verifyNote: out.read.method || out.read.reason,
-      linked: out.linked,
-      linkNote: out.linkNote,
-      status: record?.status || null,
-    },
-    200,
-    request,
-  );
-}
-
-/* ==================================================================
- * ADMIN SETUP  —  delete this whole section once setup is complete
- *
- * Everything below exists only to run the one-time CyberSource setup from a
- * browser. It generates the MLE keypair, self-signs an X.509 certificate,
- * and makes the four authenticated REST calls, storing results in KV.
- * ================================================================== */
-
-/* ---------- minimal DER encoder ---------- */
-
-function derLen(n) {
-  if (n < 0x80) return [n];
-  const b = [];
-  let v = n;
-  while (v > 0) {
-    b.unshift(v & 0xff);
-    v >>>= 8;
-  }
-  return [0x80 | b.length, ...b];
-}
-
-function derTlv(tag, content) {
-  return new Uint8Array([tag, ...derLen(content.length), ...content]);
-}
-
-function derCat(...arrs) {
-  let total = 0;
-  for (const a of arrs) total += a.length;
-  const out = new Uint8Array(total);
-  let o = 0;
-  for (const a of arrs) {
-    out.set(a, o);
-    o += a.length;
-  }
-  return out;
-}
-
-function derInt(bytes) {
-  const b = Array.from(bytes);
-  while (b.length > 1 && b[0] === 0 && !(b[1] & 0x80)) b.shift();
-  if (b[0] & 0x80) b.unshift(0); // keep the value positive
-  return derTlv(0x02, new Uint8Array(b));
-}
-
-const derNull = () => new Uint8Array([0x05, 0x00]);
-const derSeq = (...p) => derTlv(0x30, derCat(...p));
-const derSet = (...p) => derTlv(0x31, derCat(...p));
-const derBitStr = (b) => derTlv(0x03, derCat(new Uint8Array([0x00]), b));
-const derOctet = (b) => derTlv(0x04, b);
-const derBool = (v) => new Uint8Array([0x01, 0x01, v ? 0xff : 0x00]);
-const derUtf8 = (s) => derTlv(0x0c, new TextEncoder().encode(s));
-const derPrintable = (s) => derTlv(0x13, new TextEncoder().encode(s));
-
-const DER_OID = {
-  sha256WithRSA: new Uint8Array([
-    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b,
-  ]),
-  commonName: new Uint8Array([0x06, 0x03, 0x55, 0x04, 0x03]),
-  orgName: new Uint8Array([0x06, 0x03, 0x55, 0x04, 0x0a]),
-  country: new Uint8Array([0x06, 0x03, 0x55, 0x04, 0x06]),
-  basicConstraints: new Uint8Array([0x06, 0x03, 0x55, 0x1d, 0x13]),
-};
-
-function derRdn(oid, value) {
-  return derSet(derSeq(oid, value));
-}
-
-function derUtcTime(d) {
-  const p = (n) => String(n).padStart(2, "0");
-  const s =
-    p(d.getUTCFullYear() % 100) +
-    p(d.getUTCMonth() + 1) +
-    p(d.getUTCDate()) +
-    p(d.getUTCHours()) +
-    p(d.getUTCMinutes()) +
-    p(d.getUTCSeconds()) +
-    "Z";
-  return derTlv(0x17, new TextEncoder().encode(s));
-}
-
-/**
- * Generate an RSA-2048 keypair and a self-signed X.509 certificate for it.
- * Verified against `openssl x509 -text` and `openssl verify`.
- *
- * The keypair is generated for RSA-OAEP (what JWE decryption needs) and the
- * same material is re-imported as RSASSA-PKCS1-v1_5 purely to sign the
- * certificate — WebCrypto keys are bound to one algorithm each.
- */
-/**
- * Returns the contents of the subjectPublicKey BIT STRING inside an SPKI
- * structure (without the leading unused-bits byte).
- */
-function spkiPublicKeyBits(spki) {
-  let i = 0;
-  const readLen = () => {
-    let len = spki[i++];
-    if (len & 0x80) {
-      const n = len & 0x7f;
-      len = 0;
-      for (let k = 0; k < n; k++) len = (len << 8) | spki[i++];
-    }
-    return len;
-  };
-  if (spki[i++] !== 0x30) throw new Error("spki: expected SEQUENCE");
-  readLen();
-  if (spki[i++] !== 0x30) throw new Error("spki: expected AlgorithmIdentifier");
-  const algLen = readLen(); // read first: `i += readLen()` would use the old i
-  i += algLen;
-  if (spki[i++] !== 0x03) throw new Error("spki: expected BIT STRING");
-  const len = readLen();
-  return spki.slice(i + 1, i + len);
-}
-
-async function generateMleCertificate({ cn, org, country, days }) {
-  const kp = await crypto.subtle.generateKey(
-    {
-      name: "RSA-OAEP",
-      modulusLength: 2048,
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: "SHA-256",
-    },
-    true,
-    ["encrypt", "decrypt"],
-  );
-
-  const spki = new Uint8Array(
-    await crypto.subtle.exportKey("spki", kp.publicKey),
-  );
-  const pkcs8 = new Uint8Array(
-    await crypto.subtle.exportKey("pkcs8", kp.privateKey),
-  );
-  const jwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
-
-  const signKey = await crypto.subtle.importKey(
-    "pkcs8",
-    pkcs8,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-
-  // Issuer and subject are identical for a self-signed certificate.
-  const name = derSeq(
-    derRdn(DER_OID.commonName, derUtf8(cn)),
-    derRdn(DER_OID.orgName, derUtf8(org)),
-    derRdn(DER_OID.country, derPrintable(country)),
-  );
-
-  // Start 10 minutes in the past so a server clock that is slightly behind
-  // never sees the certificate as "not yet valid". Total validity stays
-  // exactly `days`, as with `openssl req -x509 -days`.
-  const now = new Date(Date.now() - 10 * 60 * 1000);
-  const notAfter = new Date(now.getTime() + days * 86400000);
-
-  const serial = crypto.getRandomValues(new Uint8Array(16));
-  serial[0] &= 0x7f;
-
-  const sigAlg = derSeq(DER_OID.sha256WithRSA, derNull());
-
-  // Same extensions `openssl req -x509` writes: Subject Key Identifier,
-  // Authority Key Identifier, and Basic Constraints (critical, CA:TRUE).
-  // The key identifier is the SHA-1 of the public key BIT STRING contents
-  // (RFC 5280 section 4.2.1.2, method 1).
-  const keyId = new Uint8Array(
-    await crypto.subtle.digest("SHA-1", spkiPublicKeyBits(spki)),
-  );
-  const OID_SKI = new Uint8Array([0x06, 0x03, 0x55, 0x1d, 0x0e]);
-  const OID_AKI = new Uint8Array([0x06, 0x03, 0x55, 0x1d, 0x23]);
-
-  const extensions = derTlv(
-    0xa3,
-    derSeq(
-      derSeq(OID_SKI, derOctet(derOctet(keyId))),
-      derSeq(OID_AKI, derOctet(derSeq(derTlv(0x80, keyId)))),
-      derSeq(
-        DER_OID.basicConstraints,
-        derBool(true),
-        derOctet(derSeq(derBool(true))),
-      ),
-    ),
-  );
-
-  const tbs = derSeq(
-    derTlv(0xa0, derInt(new Uint8Array([0x02]))), // version v3
-    derInt(serial),
-    sigAlg,
-    name,
-    derSeq(derUtcTime(now), derUtcTime(notAfter)),
-    name,
-    spki,
-    extensions,
-  );
-
-  const sig = new Uint8Array(
-    await crypto.subtle.sign("RSASSA-PKCS1-v1_5", signKey, tbs),
-  );
-  const certDer = derSeq(tbs, sigAlg, derBitStr(sig));
-
-  return { certB64: bytesToB64(certDer), jwk };
-}
-
-/* ---------- HTTP Signature auth ---------- */
-
-async function sha256B64(text) {
-  const h = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(text),
-  );
-  return bytesToB64(new Uint8Array(h));
-}
-
-/**
- * The spelling of "date" and "(request-target)" must match in three places:
- * the HTTP header, the signing string, and the headers="..." list. Mixing
- * spellings is the most common cause of a 401 here.
- */
-async function cybsCall(method, path, bodyObj, opts = {}) {
-  // opts.creds picks another credential set (e.g. CYBS_TEST); default CYBS.
-  const c = opts.creds || CYBS;
-  // A raw string body is passed through untouched — the capture-context call
-  // needs the exact bytes it signs. Objects get stringified as usual.
-  const body =
-    typeof bodyObj === "string"
-      ? bodyObj
-      : bodyObj
-        ? JSON.stringify(bodyObj)
-        : null;
-  const date = new Date().toUTCString();
-  const verb = method.toLowerCase();
-
-  const lines = [
-    `host: ${c.host}`,
-    `date: ${date}`,
-    `(request-target): ${verb} ${path}`,
-  ];
-  const names = ["host", "date", "(request-target)"];
-
-  const headers = {
-    "v-c-merchant-id": c.organizationId,
-    Date: date,
-    Accept: "application/json",
-  };
-
-  if (body) {
-    const digest = "SHA-256=" + (await sha256B64(body));
-    lines.push(`digest: ${digest}`);
-    names.push("digest");
-    headers["Digest"] = digest;
-    headers["Content-Type"] = opts.contentType || "application/json";
-  }
-
-  lines.push(`v-c-merchant-id: ${c.organizationId}`);
-  names.push("v-c-merchant-id");
-
-  const signature = await hmacB64(c.restSecret, lines.join("\n"));
-  headers["Signature"] =
-    `keyid="${c.restKeyId}", algorithm="HmacSHA256", ` +
-    `headers="${names.join(" ")}", signature="${signature}"`;
-
-  if (opts.accept) headers["Accept"] = opts.accept;
-
-  const res = await fetch(`https://${c.host}${path}`, {
-    method,
-    headers,
-    body,
-    ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
-  });
-  const text = await res.text();
-
-  let parsed = null;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    /* not JSON — capture-contexts returns a bare JWT */
-  }
-
-  return {
-    status: res.status,
-    ok: res.ok,
-    body: parsed ?? text.slice(0, 2000),
-    raw: text,
-  };
-}
-
-/* ---------- setup steps ---------- */
-
-async function stepProducts() {
-  return cybsCall(
-    "GET",
-    `/notification-subscriptions/v2/products/${CYBS.organizationId}`,
-  );
-}
-
-async function stepSigKey(env) {
-  const r = await cybsCall("POST", "/kms/egress/v2/keys-sym", {
-    clientRequestAction: "CREATE",
-    keyInformation: {
-      provider: "nrtd",
-      tenant: CYBS.organizationId,
-      keyType: "sharedSecret",
-      organizationId: CYBS.organizationId,
-      expiryDuration: "365",
-    },
-  });
-
-  const info = r.body?.keyInformation;
-  if (r.ok && info?.key) {
-    await saveSetup(env, { sigKeyId: info.keyId, sigKey: info.key });
-    // Never echo the key value back over HTTP.
-    return {
-      ...r,
-      body: { ...r.body, keyInformation: { ...info, key: "[stored in KV]" } },
-    };
-  }
-  return r;
-}
-
-async function stepMleCert(env, endpoint) {
-  // The MLE certificate is STOREd with provider = organization ID and
-  // tenant = "nrtd", 90-day validity (CyberSource support, Oct 2026).
-  // Earlier attempts used keys-asym with provider and tenant swapped; those
-  // returned 201 but the notification service's key lookup never found them.
-  const { certB64, jwk } = await generateMleCertificate({
-    cn: CYBS.restKeyId, // CN = REST shared secret key ID
-    org: CYBS.organizationId, // O = MID
-    country: "JO",
-    days: 90,
-  });
-
-  // Keep the private key before registering, so a registered certificate is
-  // never left without its private key.
-  await saveSetup(env, { pendingMleJwk: jwk, pendingMleCertB64: certB64 });
-
-  // Confirmed working on production (19 Oct 2026): keys-ASYM with
-  // provider = org ID and tenant = "nrtd". The support guide's keys-sym URL
-  // returns 400 for this body. ?endpoint=sym is kept only for diagnosis.
-  const path =
-    endpoint === "sym" ? "/kms/egress/v2/keys-sym" : "/kms/egress/v2/keys-asym";
-  const keyInformation = {
-    provider: CYBS.organizationId,
-    tenant: "nrtd",
-    keyType: "publickey",
-    organizationId: CYBS.organizationId,
-    pub: certB64,
-    expiryDuration: "90",
-  };
-  const r = await cybsCall("POST", path, {
-    clientRequestAction: "STORE",
-    keyInformation,
-  });
-  // Echo what was sent (minus the certificate) so a rejection can be
-  // reported to CyberSource precisely.
-  r.sent = {
-    host: CYBS.host,
-    path,
-    clientRequestAction: "STORE",
-    keyInformation: { ...keyInformation, pub: certB64.slice(0, 24) + "..." },
-  };
-
-  const keyId = r.body?.keyInformation?.keyId;
-  if (r.ok && keyId) {
-    const s = await loadSetupFresh(env);
-    await saveSetup(env, {
-      mleJwk: jwk,
-      mleCertB64: certB64,
-      mleKeyId: keyId,
-      mleKeys: { ...(s.mleKeys || {}), [keyId]: jwk },
-      pendingMleJwk: null,
-      pendingMleCertB64: null,
-    });
-    cachedMleKeys = {};
-  }
-  return r;
-}
-
-async function stepCreate(env) {
-  const r = await cybsCall("POST", "/notification-subscriptions/v2/webhooks", {
-    name: "BAE Unified Checkout v2",
-    description: "Out-of-band payment outcome for BAE UC integration",
-    organizationId: CYBS.organizationId,
-    products: [{ productId: CYBS.productId, eventTypes: CYBS.eventTypes }],
-    webhookUrl: CYBS.webhookUrl,
-    healthCheckUrl: CYBS.healthUrl,
-    // Top-level field, lowercase f, distinct from retryPolicy.deactivateFlag.
-    // Without it the subscription is created but never auto-activates.
-    deactivateflag: "true",
-    // DESCENDANTS also covers child MIDs. Broader than SELF, and the only
-    // way to catch an event that fires on a sibling/child of this org.
-    notificationScope: "DESCENDANTS",
-    retryPolicy: {
-      algorithm: "ARITHMETIC",
-      firstRetry: 1,
-      interval: 1,
-      numberOfRetries: 3,
-      deactivateFlag: "false",
-      repeatSequenceCount: 0,
-      repeatSequenceWaitTime: 0,
-    },
-    securityPolicy: { securityType: "key", proxyType: "external" },
-  });
-
-  if (r.ok && r.body?.webhookId)
-    await saveSetup(env, { webhookId: r.body.webhookId });
-  return r;
-}
-
-/**
- * Update the existing subscription in place. The API dedupes on webhookUrl,
- * not name, so a second subscription pointing at the same URL is rejected
- * with "Record already exists" — this is the only way to change scope.
- */
-async function stepScope() {
-  // organizationId is required in the body even though it is in the URL.
-  return cybsCall(
-    "PATCH",
-    `/notification-subscriptions/v2/webhooks/${CYBS.webhookId}`,
-    {
-      organizationId: CYBS.organizationId,
-      healthCheckUrl: CYBS.healthUrl,
-      notificationScope: "DESCENDANTS",
-      deactivateflag: "true",
-    },
-  );
-}
-
-/**
- * Delete the current subscription. Needed before re-registering, because the
- * API dedupes on webhookUrl and each subscription needs its own certificate.
- */
-/**
- * Verify the subscription's configuration. Dispatches a synthetic notification
- * for the first event type in the subscription.
- *
- * NOTE: this endpoint uses /v1/ — not v2 like every other call here. That is
- * per CyberSource's documentation, not a typo.
- *
- * The response echoes back the expected notification message, product, and
- * event type. If it returns 200 but nothing arrives at /webhooks/cybersource,
- * the gap is in dispatch rather than in our receiver.
- */
-async function stepTest() {
-  // The {} body matters. A POST with no body omits the Digest header, and
-  // CyberSource rejects that with 401 Authentication Failed.
-  return cybsCall(
-    "POST",
-    `/notification-subscriptions/v1/webhooks/${CYBS.webhookId}`,
-    {},
-  );
-}
-
-async function stepDelete(env) {
-  return cybsCall(
-    "DELETE",
-    `/notification-subscriptions/v2/webhooks/${CYBS.webhookId}`,
-  );
-}
-
-async function stepList() {
-  return cybsCall(
-    "GET",
-    `/notification-subscriptions/v2/webhooks?organizationId=${encodeURIComponent(CYBS.organizationId)}`,
-  );
-}
-
-async function stepState(env) {
-  const s = await loadSetupFresh(env);
-  // Redact anything secret — this is served over a URL.
-  return {
-    status: 200,
-    ok: true,
-    body: {
-      sigKeyId: s.sigKeyId || null,
-      sigKeyStored: Boolean(s.sigKey),
-      mleKeyStored: Boolean(s.mleJwk),
-      mleKeyId: s.mleKeyId || null,
-      mleKeyIds: Object.keys(s.mleKeys || {}),
-      mlePending: Boolean(s.pendingMleJwk),
-      webhookId: s.webhookId || null,
-      updatedAt: s.updatedAt || null,
-    },
-  };
-}
-
-async function handleAdminSetup(request, env, url) {
-  if (url.searchParams.get("token") !== CYBS.setupToken) {
-    return new Response(JSON.stringify({ error: "forbidden" }), {
-      status: 403,
-    });
-  }
-  if (!env?.PAYMENTS) {
-    return new Response(
-      JSON.stringify({
-        error: "kv_not_bound",
-        detail: "Bind a KV namespace named PAYMENTS",
-      }),
-      { status: 500 },
-    );
-  }
-
-  const step = url.searchParams.get("step") || "state";
-  const steps = {
-    products: () => stepProducts(),
-    sigkey: () => stepSigKey(env),
-    mlecert: () => stepMleCert(env, url.searchParams.get("endpoint")),
-    create: () => stepCreate(env),
-    list: () => stepList(),
-    scope: () => stepScope(),
-    test: () => stepTest(),
-    delete: () => stepDelete(env),
-    state: () => stepState(env),
-  };
-
-  if (!steps[step]) {
-    return new Response(
-      JSON.stringify({ error: "unknown_step", valid: Object.keys(steps) }),
-      { status: 400 },
-    );
-  }
-
-  let result;
-  try {
-    result = await steps[step]();
-  } catch (err) {
-    return new Response(
-      JSON.stringify({ error: "step_failed", detail: err.message }),
-      {
-        status: 500,
-      },
-    );
-  }
-
-  return new Response(JSON.stringify({ step, ...result }, null, 2), {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store",
-    },
-  });
-}
-
-/* ==================================================================
- * DIRECT CYBERSOURCE MODE  ("cybersource" environment)
- *
- * Bypasses BAE middleware entirely and talks to CyberSource's own Unified
- * Checkout API. The point of this path is diagnostic: if a transaction we
- * submit ourselves produces a webhook while a BAE-submitted one does not,
- * the event is scoped to the submitting integration rather than the MID.
- *
- * Uses completeMandate.type = CAPTURE, so up.complete() performs auth and
- * capture in one call and no separate process-payment step is needed —
- * matching how the BAE flow already behaves from the browser's point of view.
- * ================================================================== */
-
-async function handleCybsCaptureContext(request, env, body) {
-  const origin = request.headers.get("Origin") || body.origin || "";
-  if (!origin) return json({ error: "missing_origin" }, 400, request);
-  if (!amountIsSane(body.totalAmount)) {
-    return json(
-      { error: "invalid_amount", got: body.totalAmount },
-      400,
-      request,
-    );
-  }
-
-  const currency = (body.currency || "JOD").toUpperCase();
-  const totalAmount = String(body.totalAmount).trim();
-  const reference = crypto.randomUUID();
-  const targetOrigins = ["https://ziadqula28.github.io"];
-
-  // ---- CAPTURE MODE ------------------------------------------------------
-  // body.mode: "auth" = authorisation only (hold funds, no capture); a
-  // follow-on /cybs/capture call collects them later. "capture" (default) =
-  // auth + capture in one step (a sale). Note: decisionManager stays false —
-  // Decision Manager isn't enabled on this account, so leaving it off keeps
-  // this test to one variable (the mandate type).
-  const captureMode = (body.mode || "capture").toLowerCase();
-  const mandateType = captureMode === "auth" ? "AUTH" : "CAPTURE";
-
-  // ---- PAYMENT TYPES (per session) -------------------------------------
-  // body.paymentTypes: optional subset of the methods this account offers.
-  // Tests CyberSource's documented per-session control, e.g. sending
-  // ["PANENTRY","GOOGLEPAY"] to leave Apple Pay out of an in-app checkout.
-  // Values outside the default set are ignored; a missing or empty list
-  // falls back to the default (all three).
-  const DEFAULT_PAYMENT_TYPES = ["PANENTRY", "APPLEPAY", "GOOGLEPAY"];
-  const requestedTypes = Array.isArray(body.paymentTypes)
-    ? body.paymentTypes
-        .map((t) => String(t).toUpperCase())
-        .filter((t) => DEFAULT_PAYMENT_TYPES.includes(t))
-    : [];
-  const allowedPaymentTypes = requestedTypes.length
-    ? [...new Set(requestedTypes)]
-    : DEFAULT_PAYMENT_TYPES;
-
-  // ---- SAVE CARD (TMS) ---------------------------------------------------
-  // body.saveCard: save the customer's card. Adds completeMandate.tms (token
-  // creation). clientVersion 0.35 rejects captureMandate.requestSaveCredentials
-  // (the in-checkout consent checkbox): "not defined in the schema". So with
-  // saveCard on, every card payment creates a token, and the merchant must ask
-  // the customer's permission on its own page before opening the checkout.
-  // A customer token needs the buyer's email, so email is requested too.
-  const saveCard = Boolean(body.saveCard);
-
-  const upstreamBody = {
-    targetOrigins,
-    clientVersion: "0.35",
-    allowedCardNetworks: ["VISA", "MASTERCARD", "AMEX"],
-    allowedPaymentTypes, // per-session, from body.paymentTypes (see above)
-    country: "JO",
-    locale: "en_US",
-    // AUTH = hold only (needs a follow-on capture). CAPTURE = auth + capture
-    // in one step. Set per-request via body.mode.
-    completeMandate: {
-      type: mandateType,
-      decisionManager: false,
-      consumerAuthentication: true,
-      ...(saveCard
-        ? {
-            tms: {
-              tokenCreate: true,
-              tokenTypes: ["customer", "paymentInstrument", "instrumentIdentifier"],
-            },
+        if (!placeholder || placeholder.closed) {
+          logger("shim: browser refused the pre-opened window");
+          return { active: false, restore() {} };
+        }
+
+        try {
+          placeholder.document.write(
+            '<!doctype html><meta name="viewport" content="width=device-width">' +
+              '<body style="font-family:system-ui;display:grid;place-items:center;' +
+              'height:100vh;margin:0;color:#374151">Opening secure verification…</body>',
+          );
+        } catch (e) {
+          /* cross-origin already, harmless */
+        }
+
+        window.open = function (url, name, features) {
+          if (placeholder && !placeholder.closed && !consumed) {
+            consumed = true;
+            logger("shim: handed pre-opened window to SDK");
+            if (url) {
+              try {
+                placeholder.location.replace(url);
+              } catch (e) {
+                placeholder.location.href = url;
+              }
+            }
+            return placeholder;
           }
-        : {}),
-    },
-    captureMandate: {
-      billingType: "NONE",
-      requestEmail: saveCard,
-      requestPhone: false,
-      requestShipping: false,
-      showAcceptedNetworkIcons: true,
-    },
-    orderInformation: {
-      amountDetails: { totalAmount, currency },
-      billTo: {
-        firstName: "TestFirst",
-        lastName: "TestLast",
-      },
-    },
-    // Nothing overwrites this on the direct path, so a resulting webhook
-    // should carry our own reference — which also tests correlation.
-    clientReferenceInformation: { code: reference },
-  };
-
-  console.log("cybs capture-context →", JSON.stringify(upstreamBody));
-
-  const r = await cybsCall("POST", "/up/v1/capture-contexts", upstreamBody, {
-    accept: "*/*",
-  });
-
-  console.log("cybs capture-context ←", r.status, String(r.raw).slice(0, 1500));
-
-  if (!r.ok) {
-    return json(
-      {
-        error: "cybs_capture_context_failed",
-        status: r.status,
-        detail: r.body,
-      },
-      502,
-      request,
-    );
-  }
-
-  // This endpoint returns a bare JWT, not JSON.
-  const token = String(r.raw).trim().replace(/^"|"$/g, "");
-  const ctx = normalizeCaptureContext(token);
-
-  if (!ctx.token || !ctx.clientLibrary) {
-    return json(
-      {
-        error: "unexpected_capture_context_shape",
-        detail: String(r.raw).slice(0, 500),
-      },
-      502,
-      request,
-    );
-  }
-
-  const db = store(env);
-  await db.put(`pay:${reference}`, {
-    reference,
-    status: "AWAITING_PAYMENT",
-    environment: "cybersource",
-    currency,
-    totalAmount,
-    origin,
-    captureMode, // "auth" or "capture" — needed by /cybs/capture later
-    mandateType, // "AUTH" or "CAPTURE"
-    flxJwk: captureContextJwk(ctx.token), // to verify the complete() result
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  });
-
-  return json(
-    {
-      reference,
-      token: ctx.token,
-      clientLibrary: ctx.clientLibrary,
-      clientLibraryIntegrity: ctx.clientLibraryIntegrity,
-      allowedPaymentTypes: ctx.allowedPaymentTypes,
-      targetOrigins,
-      storage: db.backend,
-      mode: "cybersource",
-      // Echo the mandate type so the frontend knows whether this was an
-      // AUTH-only hold (capture available afterwards) or a full CAPTURE sale.
-      completeMandate: mandateType,
-      paymentTypesSent: allowedPaymentTypes,
-      saveCard,
-      captureMode,
-    },
-    200,
-    request,
-  );
-}
-
-/**
- * Records the outcome the browser saw. Unlike the BAE path this is purely
- * bookkeeping — the payment is already done by the time this is called.
- * Its real value is capturing the transaction id so we can compare against
- * whatever the webhook delivers.
- */
-async function handleCybsResult(request, env, body) {
-  const { reference, result } = body;
-  const db = store(env);
-  const key = `pay:${reference}`;
-
-  // up.complete() returns a signed JWT string, not an object. Decode and
-  // verify it, and link the transaction id for the webhook.
-  const out = await recordCompleteResult(env, reference, result);
-  const f = out.fields;
-
-  const record = (await db.get(key)) || { reference };
-  const isAuthOnly = record.captureMode === "auth";
-  const approvedByBrowser =
-    f.status === "AUTHORIZED" || f.status === "COMPLETED";
-
-  // The webhook is authoritative. The browser's view only fills in while the
-  // webhook is still on its way, and never overwrites it.
-  let status = record.status;
-  if (record.confirmedBy !== "webhook" && record.status !== "CAPTURED") {
-    status = approvedByBrowser
-      ? isAuthOnly
-        ? "AUTHORIZED_HELD"
-        : "COMPLETED"
-      : "DECLINED";
-    await db.put(key, {
-      ...record,
-      status,
-      gatewayStatus: f.status,
-      confirmedBy: "browser",
-      updatedAt: Date.now(),
-    });
-  }
-
-  const authId =
-    record.authTransactionId || (out.read.verified ? f.transactionId : null);
-
-  // TMS tokens created at checkout (save card). Where they appear in the result
-  // varies, so search the whole decoded payload.
-  const tokens = findTokenIds(out.read.payload);
-  if (Object.keys(tokens).length) {
-    const latest = (await db.get(key)) || record;
-    await db.put(key, { ...latest, tokens, updatedAt: Date.now() });
-    console.log("cybs tokens ←", reference, JSON.stringify(tokens));
-  }
-
-  return json(
-    {
-      reference,
-      recorded: true,
-      transactionId: f.transactionId,
-      verified: out.read.verified,
-      linked: out.linked,
-      status,
-      tokens, // {customer, paymentInstrument, instrumentIdentifier} if a card was saved
-      // Tells the frontend whether to offer a Capture button.
-      captureAvailable: status === "AUTHORIZED_HELD" && Boolean(authId),
-    },
-    200,
-    request,
-  );
-}
-
-/* ==================================================================
- * CYBS path: void, refund, saved-card charge, transaction lookup
- *
- * These call CyberSource directly with the REST key in CYBS. They can move
- * real money, so they need the header X-Admin-Token matching
- * env.CYBS_ADMIN_TOKEN (set it with: wrangler secret put CYBS_ADMIN_TOKEN).
- * Without that secret they refuse every request.
- * ================================================================== */
-
-const CURRENCY_DECIMALS = { JOD: 3, USD: 2 };
-
-// The payments and transaction-search APIs answer in HAL JSON; the transaction
-// search API returns 406 Not Acceptable to a plain "application/json" Accept.
-const CYBS_HAL = { accept: "application/hal+json;charset=utf-8" };
-
-function fmtAmount(amount, currency) {
-  const n = Number(amount);
-  if (!Number.isFinite(n) || n <= 0) throw new Error("invalid_amount");
-  return n.toFixed(CURRENCY_DECIMALS[String(currency).toUpperCase()] ?? 2);
-}
-
-function isCybsAdmin(request, env) {
-  const expected = env?.CYBS_ADMIN_TOKEN;
-  return Boolean(expected) && request.headers.get("X-Admin-Token") === expected;
-}
-
-/** Find TMS token IDs anywhere in a result; their location varies by response. */
-function findTokenIds(obj, found = {}) {
-  if (!obj || typeof obj !== "object") return found;
-  for (const [k, v] of Object.entries(obj)) {
-    if (
-      ["customer", "paymentInstrument", "instrumentIdentifier", "shippingAddress"].includes(k) &&
-      v &&
-      typeof v === "object" &&
-      typeof v.id === "string" &&
-      !found[k]
-    ) {
-      found[k] = v.id;
-    }
-    if (v && typeof v === "object") findTokenIds(v, found);
-  }
-  return found;
-}
-
-/** Transaction id from the body, or from the stored record for a reference. */
-async function cybsTxnRecord(env, body) {
-  const record = body.reference ? await store(env).get(`pay:${body.reference}`) : null;
-  const txnId =
-    (body.transactionId && String(body.transactionId).trim()) ||
-    record?.browserResult?.transactionId ||
-    record?.authTransactionId ||
-    null;
-  return { record, txnId };
-}
-
-/**
- * An HTTP 2xx from CyberSource is not the outcome: a rejected refund (e.g. more
- * than the original) still comes back 2xx with a request ID. Judge success by the
- * status in the body: refund PENDING, void VOIDED, charge AUTHORIZED.
- */
-function cybsReply(r, extra, request, okStatuses) {
-  const status = r.body?.status || null;
-  const succeeded = r.ok && (!okStatuses || okStatuses.includes(status));
-  const reason = succeeded
-    ? null
-    : r.body?.errorInformation?.message ||
-      r.body?.errorInformation?.reason ||
-      r.body?.message ||
-      r.body?.reason ||
-      (r.ok ? `unexpected status: ${status}` : `HTTP ${r.status}`);
-  return json(
-    { httpStatus: r.status, succeeded, reason, ...extra, response: r.body || r.raw },
-    succeeded ? 200 : 502,
-    request,
-  );
-}
-
-/** Void a payment: same day, before the settlement batch. POST /pts/v2/payments/{id}/voids */
-async function handleCybsVoid(request, env, body) {
-  if (!isCybsAdmin(request, env)) return json({ error: "admin_token_required" }, 401, request);
-  const { txnId } = await cybsTxnRecord(env, body);
-  if (!txnId) return json({ error: "transactionId_required" }, 400, request);
-  console.log("cybs void →", txnId);
-  const voidBody = {
-    clientReferenceInformation: { code: body.reference || `void-${Date.now()}` },
-  };
-  // A checkout sale (authorize + capture in one step) may only be voidable as a
-  // capture. Try the payments endpoint first; on 404, retry as a capture void and
-  // report which one CyberSource accepted.
-  const id = encodeURIComponent(txnId);
-  let endpoint = "payments";
-  let r = await cybsCall("POST", `/pts/v2/payments/${id}/voids`, voidBody, CYBS_HAL);
-  if (r.status === 404) {
-    console.log("cybs void: payments endpoint 404, retrying as capture void");
-    endpoint = "captures";
-    r = await cybsCall("POST", `/pts/v2/captures/${id}/voids`, voidBody, CYBS_HAL);
-  }
-  return cybsReply(
-    r,
-    { action: "void", endpoint, transactionId: txnId, status: r.body?.status || null },
-    request,
-    ["VOIDED"],
-  );
-}
-
-/**
- * Refund a payment after settlement. A lower amount than the original is a partial
- * refund; several partial refunds are allowed up to the original total.
- * POST /pts/v2/payments/{id}/refunds
- */
-async function handleCybsRefund(request, env, body) {
-  if (!isCybsAdmin(request, env)) return json({ error: "admin_token_required" }, 401, request);
-  const { record, txnId } = await cybsTxnRecord(env, body);
-  if (!txnId) return json({ error: "transactionId_required" }, 400, request);
-  const currency = String(body.currency || record?.currency || "JOD").toUpperCase();
-  const totalAmount = fmtAmount(body.amount ?? record?.totalAmount, currency);
-  console.log("cybs refund →", txnId, totalAmount, currency);
-  const r = await cybsCall("POST", `/pts/v2/payments/${encodeURIComponent(txnId)}/refunds`, {
-    clientReferenceInformation: { code: body.reference || `refund-${Date.now()}` },
-    orderInformation: { amountDetails: { totalAmount, currency } },
-  }, CYBS_HAL);
-  return cybsReply(
-    r,
-    { action: "refund", transactionId: txnId, refundId: r.body?.id || null, amount: totalAmount, status: r.body?.status || null },
-    request,
-    ["PENDING"],
-  );
-}
-
-/**
- * Charge a saved card (merchant-initiated, card on file) with its TMS customer
- * token. A sale: authorize and capture together. POST /pts/v2/payments
- */
-async function handleCybsChargeToken(request, env, body) {
-  if (!isCybsAdmin(request, env)) return json({ error: "admin_token_required" }, 401, request);
-  const record = body.reference ? await store(env).get(`pay:${body.reference}`) : null;
-  const customerId = body.customerId || record?.tokens?.customer || null;
-  if (!customerId) return json({ error: "customerId_required" }, 400, request);
-  const currency = String(body.currency || record?.currency || "JOD").toUpperCase();
-  const totalAmount = fmtAmount(body.amount ?? record?.totalAmount, currency);
-  const recurring = body.initiator === "recurring";
-  console.log("cybs charge-token →", customerId, totalAmount, currency, recurring ? "recurring" : "unscheduled");
-  const r = await cybsCall("POST", "/pts/v2/payments", {
-    clientReferenceInformation: { code: body.newReference || `charge-${Date.now()}` },
-    processingInformation: {
-      capture: true,
-      commerceIndicator: recurring ? "recurring" : "internet",
-      authorizationOptions: {
-        initiator: { type: "merchant", storedCredentialUsed: true },
-      },
-    },
-    paymentInformation: { customer: { id: customerId } },
-    orderInformation: { amountDetails: { totalAmount, currency } },
-  }, CYBS_HAL);
-  return cybsReply(
-    r,
-    {
-      action: "charge-token",
-      customerId,
-      transactionId: r.body?.id || null,
-      status: r.body?.status || null,
-      approvalCode: r.body?.processorInformation?.approvalCode || null,
-      amount: totalAmount,
-    },
-    request,
-    ["AUTHORIZED"],
-  );
-}
-
-/** Transaction details. GET /tss/v2/transactions/{id} */
-async function handleCybsTransaction(request, env, body) {
-  if (!isCybsAdmin(request, env)) return json({ error: "admin_token_required" }, 401, request);
-  const { txnId } = await cybsTxnRecord(env, body);
-  if (!txnId) return json({ error: "transactionId_required" }, 400, request);
-  const r = await cybsCall("GET", `/tss/v2/transactions/${encodeURIComponent(txnId)}`, null, CYBS_HAL);
-  return cybsReply(r, { action: "transaction", transactionId: txnId }, request);
-}
-
-/* ==================================================================
- * BIN LOOKUP — POST /bin/v1/binlookup
- *
- * Request body we send:  { paymentInformation: { card: { number: <BIN> } } }
- * CyberSource answers 201 for every lookup; the result is in body.status:
- *   COMPLETED -> one BIN record found
- *   MULTIPLE  -> several account ranges match (send more digits)
- *   NO MATCH  -> no record for these digits
- * 400 = invalid request, 502 = CyberSource error or timeout.
- *
- * Only a 6 to 8 digit BIN is accepted here. Full card numbers are refused
- * before anything is sent, and the BIN digits are not written to the log.
- * binLookup() and normalizeBinLookup() are separate from the HTTP handler so
- * transaction analytics by issuer can reuse them later.
- * ================================================================== */
-
-const BIN_LOOKUP_ENVS = {
-  production: () => CYBS,
-  test: () => CYBS_TEST,
-};
-const BIN_LOOKUP_TIMEOUT_MS = 10000;
-
-/** Returns { bin } or { error, message }. Accepts spaces and dashes. */
-function validateBin(input) {
-  const raw = input == null ? "" : String(input);
-  const bin = raw.replace(/[\s-]/g, "");
-  if (!bin) return { error: "bin_required", message: "Enter a BIN." };
-  if (!/^\d+$/.test(bin))
-    return { error: "bin_invalid", message: "A BIN contains digits only." };
-  if (bin.length < 6)
-    return { error: "bin_too_short", message: "Enter at least the first 6 digits." };
-  if (bin.length > 8)
-    return {
-      error: "bin_too_long",
-      message: "Enter only the first 6 to 8 digits. Full card numbers are not accepted.",
-    };
-  return { bin };
-}
-
-/** Keeps only the fields CyberSource actually returned. */
-function normalizeBinLookup(body) {
-  const pick = (obj, keys) => {
-    const out = {};
-    for (const k of keys) {
-      const v = obj?.[k];
-      if (v !== undefined && v !== null && v !== "") out[k] = v;
-    }
-    return Object.keys(out).length ? out : null;
-  };
-
-  const rawStatus = body?.status || null;
-  const s = String(rawStatus || "").toUpperCase().replace(/[\s_]+/g, " ").trim();
-  const issuerRaw = body?.issuerInformation;
-  const accountRaw = body?.paymentAccountInformation;
-  let match;
-  if (s === "COMPLETED" || s === "SUCCESS") match = "FOUND";
-  else if (s === "MULTIPLE") match = "MULTIPLE";
-  else if (s === "NO MATCH" || s === "NOMATCH") match = "NO_MATCH";
-  else if (!rawStatus && (issuerRaw || accountRaw)) match = "FOUND";
-  else match = "UNKNOWN";
-
-  const issuer = pick(issuerRaw, ["name", "country", "binLength", "accountPrefix", "phoneNumber"]);
-  const card = pick(accountRaw?.card, ["brandName", "type", "currency", "maxLength", "credentialType"]);
-  // Co-badged cards list every brand.
-  const brands = Array.isArray(accountRaw?.card?.brands)
-    ? accountRaw.card.brands.map((b) => pick(b, ["brandName", "type"])).filter(Boolean)
-    : null;
-  // Features vary by network; pass through whatever came back.
-  const features = accountRaw?.features && typeof accountRaw.features === "object"
-    ? pick(accountRaw.features, Object.keys(accountRaw.features))
-    : null;
-  const network = pick(accountRaw?.network, ["id"]);
-
-  return {
-    match,
-    status: rawStatus,
-    requestId: body?.id || null,
-    submitTimeUtc: body?.submitTimeUtc || null,
-    issuerNameReturned: Boolean(issuer?.name),
-    ...(issuer ? { issuer } : {}),
-    ...(card ? { card } : {}),
-    ...(brands && brands.length ? { brands } : {}),
-    ...(features ? { features } : {}),
-    ...(network ? { network } : {}),
-  };
-}
-
-/**
- * Calls CyberSource. Returns { ok, httpStatus, result | error, reason, response }.
- * Never throws: a timeout or network failure comes back as an error.
- */
-async function binLookup(bin, environment) {
-  const creds = BIN_LOOKUP_ENVS[environment]();
-  if (!creds.organizationId || !creds.restKeyId || !creds.restSecret) {
-    return {
-      ok: false,
-      httpStatus: null,
-      error: "environment_not_configured",
-      reason:
-        environment === "test"
-          ? "No test credentials: fill in CYBS_TEST in the worker."
-          : "No production credentials in CYBS.",
-    };
-  }
-
-  const reqBody = { paymentInformation: { card: { number: bin } } };
-  const opts = { creds, timeoutMs: BIN_LOOKUP_TIMEOUT_MS };
-  let r;
-  try {
-    r = await cybsCall("POST", "/bin/v1/binlookup", reqBody, opts);
-    // The docs don't say which Accept this API wants; retry once in HAL on 406.
-    if (r.status === 406) {
-      r = await cybsCall("POST", "/bin/v1/binlookup", reqBody, { ...opts, ...CYBS_HAL });
-    }
-  } catch (err) {
-    const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";
-    return {
-      ok: false,
-      httpStatus: null,
-      error: timedOut ? "cybersource_timeout" : "cybersource_unreachable",
-      reason: timedOut
-        ? `No answer from CyberSource within ${BIN_LOOKUP_TIMEOUT_MS / 1000} seconds.`
-        : "Could not reach CyberSource: " + (err?.message || "network error"),
-    };
-  }
-
-  if (r.ok) {
-    return { ok: true, httpStatus: r.status, result: normalizeBinLookup(r.body), response: r.body };
-  }
-
-  const upstream =
-    r.body?.errorInformation?.message ||
-    r.body?.errorInformation?.reason ||
-    r.body?.message ||
-    r.body?.reason ||
-    r.body?.response?.rmsg ||
-    null;
-  let error = "cybersource_error";
-  let reason = upstream || `CyberSource returned HTTP ${r.status}.`;
-  if (r.status === 401) {
-    error = "cybersource_auth_failed";
-    reason = "CyberSource rejected the REST key" + (upstream ? ": " + upstream : ".");
-  } else if (r.status === 403) {
-    error = "cybersource_not_enabled";
-    reason =
-      "CyberSource refused the request. The account is probably not enabled for BIN Lookup" +
-      (upstream ? ": " + upstream : ".");
-  } else if (r.status === 400) {
-    error = "cybersource_invalid_request";
-  } else if (r.status >= 500) {
-    error = "cybersource_unavailable";
-  }
-  return { ok: false, httpStatus: r.status, error, reason, response: r.body || r.raw };
-}
-
-/** POST /cybs/bin-lookup  { bin, environment? }  needs X-Admin-Token. */
-async function handleCybsBinLookup(request, env, body) {
-  if (!isCybsAdmin(request, env)) return json({ error: "admin_token_required" }, 401, request);
-
-  const environment = String(body.environment || "production").toLowerCase();
-  if (!BIN_LOOKUP_ENVS[environment]) {
-    return json(
-      { error: "unknown_environment", message: "Use production or test.", valid: Object.keys(BIN_LOOKUP_ENVS) },
-      400,
-      request,
-    );
-  }
-
-  const v = validateBin(body.bin);
-  if (v.error) return json({ error: v.error, message: v.message }, 400, request);
-
-  // BIN digits stay out of the log; length and outcome are enough to debug.
-  console.log("bin-lookup →", environment, v.bin.length + " digits");
-  const out = await binLookup(v.bin, environment);
-  console.log(
-    "bin-lookup ←",
-    environment,
-    out.httpStatus ?? "-",
-    out.ok ? out.result.match : out.error,
-  );
-
-  if (!out.ok) {
-    const status = out.error === "environment_not_configured" ? 400 : out.error === "cybersource_timeout" ? 504 : 502;
-    return json(
-      { error: out.error, message: out.reason, environment, bin: v.bin, httpStatus: out.httpStatus, response: out.response ?? null },
-      status,
-      request,
-    );
-  }
-  return json(
-    { environment, bin: v.bin, httpStatus: out.httpStatus, ...out.result, response: out.response },
-    200,
-    request,
-  );
-}
-
-/**
- * Follow-on capture of a held authorization (the second half of the pre-auth
- * flow). Takes the reference of a transaction placed with completeMandate.type
- * = AUTH, looks up its stored authorization transaction id, and calls
- * CyberSource's capture resource to collect the full held amount.
- *
- * POST /pts/v2/payments/{authId}/captures
- * Captures the full authorized amount (totalAmount from the original record).
- */
-async function handleCybsCapture(request, env, body) {
-  const { reference } = body;
-  if (!reference) return json({ error: "reference_required" }, 400, request);
-
-  const db = store(env);
-  const key = `pay:${reference}`;
-  const record = await db.get(key);
-
-  if (!record) {
-    return json({ error: "unknown_reference", reference }, 404, request);
-  }
-
-  const authId = record.authTransactionId;
-  if (!authId) {
-    // Either it wasn't an AUTH, or the auth id was never captured from the
-    // result. Surface it clearly rather than calling CyberSource with no id.
-    return json(
-      {
-        error: "no_authorization_to_capture",
-        detail:
-          "No stored authorization transaction id for this reference. " +
-          "Capture only applies to an AUTH-mode (held) transaction whose " +
-          "result was recorded.",
-        recordStatus: record.status || null,
-        captureMode: record.captureMode || null,
-      },
-      400,
-      request,
-    );
-  }
-
-  if (record.status === "CAPTURED") {
-    // Idempotency: don't double-capture.
-    return json(
-      {
-        reference,
-        status: "CAPTURED",
-        replayed: true,
-        captureId: record.captureId || null,
-      },
-      200,
-      request,
-    );
-  }
-
-  const captureBody = {
-    clientReferenceInformation: { code: reference },
-    orderInformation: {
-      amountDetails: {
-        totalAmount: record.totalAmount,
-        currency: record.currency || "JOD",
-      },
-    },
-  };
-
-  console.log(
-    "cybs capture → authId=" + authId,
-    record.totalAmount,
-    record.currency,
-    JSON.stringify(captureBody),
-  );
-
-  const r = await cybsCall(
-    "POST",
-    `/pts/v2/payments/${authId}/captures`,
-    captureBody,
-  );
-
-  console.log("cybs capture ←", r.status, String(r.raw).slice(0, 800));
-
-  if (!r.ok) {
-    await db.put(key, {
-      ...record,
-      status: "CAPTURE_FAILED",
-      captureError: r.body,
-      updatedAt: Date.now(),
-    });
-    return json(
-      { error: "capture_failed", status: r.status, detail: r.body, authId },
-      502,
-      request,
-    );
-  }
-
-  const captureId = r.body?.id || null;
-  const captureStatus = r.body?.status || null; // typically "PENDING"
-
-  await db.put(key, {
-    ...record,
-    status: "CAPTURED",
-    captureId,
-    captureStatus,
-    captureResponse: r.body || null,
-    updatedAt: Date.now(),
-  });
-
-  return json(
-    {
-      reference,
-      status: "CAPTURED",
-      authTransactionId: authId,
-      captureId,
-      captureStatus, // "PENDING" = capture accepted, queued for settlement
-    },
-    200,
-    request,
-  );
-}
-
-/* ==================================================================
- * Route: capture context
- * ================================================================== */
-
-async function handleCaptureContext(request, env, body) {
-  // The Origin header is the real browsing origin — more reliable than the
-  // body value, and targetOrigins must match it exactly (scheme+host+port).
-  const origin = request.headers.get("Origin") || body.origin || "";
-
-  console.log("REAL origin header:", JSON.stringify(origin));
-
-  if (!ALLOW_ANY_ORIGIN && !ALLOWED_ORIGINS.includes(origin)) {
-    return json({ error: "origin_not_allowed", origin }, 403, request);
-  }
-  if (!origin) {
-    return json({ error: "missing_origin" }, 400, request);
-  }
-  if (!amountIsSane(body.totalAmount)) {
-    return json(
-      { error: "invalid_amount", got: body.totalAmount },
-      400,
-      request,
-    );
-  }
-
-  const environment = body.environment === "dev" ? "dev" : "prod";
-  const currency = (body.currency || "JOD").toUpperCase();
-  // Preserve the precision the client already applied for this currency's
-  // decimal places (JPY=0, dinars=3, others=2). Do NOT force .toFixed(2) here
-  // or JPY/dinar amounts get the wrong number of decimals sent to the gateway.
-  const totalAmount = String(body.totalAmount).trim();
-
-  const merchant = String(body.merchant || "main").toLowerCase();
-  if (!BAE_MERCHANTS.includes(merchant)) {
-    return json(
-      { error: "unknown_merchant", got: body.merchant, valid: BAE_MERCHANTS },
-      400,
-      request,
-    );
-  }
-  const cfg = resolveConfig(env, environment, merchant);
-  if (!cfg.configured) {
-    return json(
-      {
-        error: "merchant_not_configured",
-        merchant,
-        environment,
-        detail: "No sub-account key: add " + cfg.missingField,
-      },
-      400,
-      request,
-    );
-  }
-
-  // Sent by the page as a list; the default keeps older pages unchanged.
-  const parsedOrigins = parseTargetOrigins(body.targetOrigins);
-  if (parsedOrigins.error) {
-    return json(
-      { error: "invalid_target_origins", detail: parsedOrigins.error, bad: parsedOrigins.bad },
-      400,
-      request,
-    );
-  }
-  const targetOrigins = parsedOrigins.origins;
-  const reference = crypto.randomUUID();
-
-  const upstreamBody = {
-    targetOrigins,
-    totalAmount,
-    currency,
-    allowedPaymentTypes: ["GOOGLEPAY"],
-    withDecode: WITH_DECODE,
-
-    // Tested 2026-08-03: BAE overwrites this downstream, so the Merchant
-    // Reference Number in the Business Center is their millisecond timestamp,
-    // not this UUID. Harmless to send; correlation cannot rely on it.
-    clientReferenceInformation: { code: reference },
-  };
-
-  console.log(
-    "capture-context →",
-    environment,
-    "merchant=" + merchant,
-    JSON.stringify(upstreamBody),
-  );
-
-  const upstream = await fetch(cfg.captureUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Authorization: cfg.captureAuth,
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    },
-    body: JSON.stringify(upstreamBody),
-  });
-
-  const raw = await upstream.text();
-  console.log("capture-context ←", upstream.status);
-
-  if (!upstream.ok) {
-    return json(
-      { error: "capture_context_failed", status: upstream.status, detail: raw },
-      502,
-      request,
-    );
-  }
-
-  const ctx = normalizeCaptureContext(raw);
-  if (!ctx.token || !ctx.clientLibrary) {
-    return json(
-      { error: "unexpected_capture_context_shape", detail: raw.slice(0, 500) },
-      502,
-      request,
-    );
-  }
-
-  const db = store(env);
-  await db.put(`pay:${reference}`, {
-    reference,
-    status: "AWAITING_PAYMENT",
-    environment,
-    merchant, // "main" or "sub": /process-payment must use the same key
-    currency,
-    totalAmount,
-    origin,
-    flxJwk: captureContextJwk(ctx.token), // to verify the complete() result
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  });
-
-  return json(
-    {
-      reference,
-      token: ctx.token,
-      clientLibrary: ctx.clientLibrary,
-      clientLibraryIntegrity: ctx.clientLibraryIntegrity,
-      allowedPaymentTypes: ctx.allowedPaymentTypes,
-      targetOrigins,
-      storage: db.backend,
-      merchant,
-      withDecode: WITH_DECODE,
-      sdkSource: ctx.sdkSource,
-      sdkMismatch: ctx.sdkMismatch,
-      jsonLibrary: ctx.jsonLibrary,
-      jwtLibrary: ctx.jwtLibrary,
-    },
-    200,
-    request,
-  );
-}
-
-/* ==================================================================
- * Route: process payment (idempotent per reference)
- * ================================================================== */
-
-async function handleProcessPayment(request, env, body) {
-  const { reference, transientToken } = body;
-  if (!transientToken) {
-    return json({ error: "transient_token_required" }, 400, request);
-  }
-
-  const db = store(env);
-  const key = `pay:${reference}`;
-  let record = reference ? await db.get(key) : null;
-
-  // Tolerate a missing record (memory fallback across isolates) so a live
-  // test never dies just because state was lost — but log it loudly.
-  if (!record) {
-    console.log("process-payment: no record for", reference, "— proceeding");
-    record = {
-      reference: reference || crypto.randomUUID(),
-      status: "AWAITING_PAYMENT",
-      environment: body.environment === "dev" ? "dev" : "prod",
-      merchant: body.merchant === "sub" ? "sub" : "main",
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      orphaned: true,
-    };
-  }
-
-  if (record.status === "COMPLETED" || record.status === "DECLINED") {
-    return json({ ...record, replayed: true }, 200, request);
-  }
-  if (
-    record.status === "PROCESSING" &&
-    Date.now() - record.updatedAt < PROCESSING_LOCK_MS
-  ) {
-    return json({ ...record, replayed: true }, 200, request);
-  }
-
-  // Same merchant key the capture context was minted with. Records made
-  // before the merchant field existed are "main".
-  const merchant = record.merchant === "sub" ? "sub" : "main";
-  const cfg = resolveConfig(env, record.environment, merchant);
-  if (!cfg.configured || !cfg.companyId) {
-    // Checked before taking the lock, so nothing is left in PROCESSING.
-    return json(
-      {
-        error: "merchant_not_configured",
-        merchant,
-        environment: record.environment,
-        detail: !cfg.configured
-          ? "No sub-account key: add " + cfg.missingField
-          : "No companyId for the sub-account: add " + cfg.companyField,
-      },
-      400,
-      request,
-    );
-  }
-
-  await db.put(key, { ...record, status: "PROCESSING", updatedAt: Date.now() });
-
-  const processBody = { token: transientToken, companyId: cfg.companyId };
-
-  console.log(
-    "process-payment →",
-    record.environment,
-    "merchant=" + merchant,
-    record.reference,
-    record.currency || "?",
-    record.totalAmount || "?",
-    "companyId=" + cfg.companyId,
-  );
-
-  let upstream;
-  let raw = "";
-  try {
-    upstream = await fetch(cfg.processUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        Authorization: cfg.processAuth,
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      },
-      body: JSON.stringify(processBody),
-    });
-    raw = await upstream.text();
-  } catch (err) {
-    // Release the lock so the client can retry.
-    await db.put(key, {
-      ...record,
-      status: "AWAITING_PAYMENT",
-      lastError: err.message,
-      updatedAt: Date.now(),
-    });
-    return json(
-      { error: "upstream_unreachable", detail: err.message },
-      502,
-      request,
-    );
-  }
-
-  console.log("process-payment ←", upstream.status, raw.slice(0, 300));
-
-  let parsed = null;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    /* keep raw */
-  }
-
-  const declined =
-    !upstream.ok ||
-    (parsed &&
-      typeof parsed.status === "string" &&
-      parsed.status !== "COMPLETED");
-
-  const finalRecord = {
-    ...record,
-    status: declined ? "DECLINED" : "COMPLETED",
-    gatewayStatus: parsed?.status || String(upstream.status),
-    gatewayHttpStatus: upstream.status,
-    // Verbatim so the harness can show exactly what BAE returned.
-    gatewayResponse: parsed || raw.slice(0, 2000),
-    // Echo what we SENT, so a failing charge can be matched to a
-    // Cybersource-side record by whoever has log access.
-    sentTokenPrefix: String(transientToken).slice(0, 24),
-    sentCompanyId: cfg.companyId,
-    updatedAt: Date.now(),
-  };
-
-  await db.put(key, finalRecord);
-
-  // Build the correlation index the webhook handler reads. Best-effort: a
-  // failure here must never break a payment that already succeeded.
-  try {
-    await indexTransaction(env, parsed, record.reference);
-  } catch (err) {
-    console.error("indexTransaction failed:", err.message);
-  }
-
-  return json(finalRecord, upstream.ok ? 200 : 502, request);
-}
-
-/* ==================================================================
- * Route: status polling (iOS tab-suspension recovery)
- * ================================================================== */
-
-async function handleStatus(request, env, url) {
-  const reference = url.searchParams.get("reference");
-  if (!reference) return json({ error: "reference_required" }, 400, request);
-
-  const record = await store(env).get(`pay:${reference}`);
-  if (!record) return json({ reference, status: "UNKNOWN" }, 404, request);
-  return json(record, 200, request);
-}
-
-/* ================================================================== */
-
-export default {
-  // ctx is required — ctx.waitUntil is how the webhook handler does its work
-  // after already answering 200.
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(request) });
-    }
-
-    try {
-      // Webhook routes go FIRST and deliberately skip corsHeaders() —
-      // CyberSource is a server, not a browser, and there is no Origin to
-      // reflect. Placing these after the POST guard would route the health
-      // check into handleCaptureContext and return missing_origin.
-      // One-time setup route. Delete this line and the ADMIN SETUP section
-      // once the subscription is live.
-      if (url.pathname.endsWith("/admin/setup")) {
-        return await handleAdminSetup(request, env, url);
+          return original.call(window, url, name, features);
+        };
+
+        const timer = setTimeout(() => {
+          if (!consumed) {
+            logger("shim: SDK used an iframe, closing unused window");
+            cleanup();
+          }
+        }, 12000);
+
+        function cleanup() {
+          clearTimeout(timer);
+          window.open = original;
+          if (placeholder && !consumed && !placeholder.closed) {
+            try {
+              placeholder.close();
+            } catch (e) {}
+          }
+        }
+
+        logger("shim: pre-opened window ready");
+        return { active: true, restore: cleanup };
       }
 
-      if (url.pathname.endsWith("/webhooks/health")) {
-        return await handleWebhookHealth();
-      }
-      if (
-        request.method === "POST" &&
-        url.pathname.endsWith("/webhooks/cybersource")
-      ) {
-        return await handleWebhook(request, env, ctx);
-      }
+      /* =================================================================
+       * BaePay – everything that must stay outside the framework
+       * ================================================================= */
+      window.BaePay = {
+        up: null,
+        transientToken: null,
+        captureContext: null,
+        reference: null,
+        settled: false,
+        app: null,
 
-      if (
-        request.method === "GET" &&
-        url.pathname.endsWith("/payment-status")
-      ) {
-        return await handleStatus(request, env, url);
-      }
-      if (request.method !== "POST") {
-        return json({ error: "method_not_allowed" }, 405, request);
-      }
+        /** Synchronous. Called straight from a native onclick. */
+        confirmTap() {
+          const app = this.app;
+          if (!this.up || !this.transientToken) return;
 
-      const body = await request.json().catch(() => ({}));
+          // 1. Pre-open the window while the tap grant is still alive.
+          const shim = IS_IOS
+            ? installOpenShim((m) => app.logLine(m))
+            : { active: false, restore() {} };
+          app.diag.shim = shim.active ? "armed" : "not needed";
 
-      if (url.pathname.endsWith("/cybs/capture-context")) {
-        return await handleCybsCaptureContext(request, env, body);
+          // 2. up.complete() must be the FIRST thing after the shim.
+          //    No await, no state write, no fetch above this line.
+          let promise;
+          try {
+            promise = this.up.complete(this.transientToken);
+          } catch (err) {
+            shim.restore();
+            app.fail("complete() threw synchronously: " + err.message);
+            return;
+          }
+
+          // 3. Only now is it safe to touch the UI.
+          app.onCompleteStarted();
+          promise
+            .then((result) => {
+              shim.restore();
+              app.onCompleteResolved(result);
+            })
+            .catch((err) => {
+              shim.restore();
+              app.onCompleteRejected(err);
+            });
+        },
+
+        /** Synchronous. Re-runs 3DS verification after a suspended tab. */
+        resumeTap() {
+          this.confirmTap();
+        },
+      };
+
+      /* =================================================================
+       * Alpine app
+       * ================================================================= */
+      function harness() {
+        return {
+          PROXY: PROXY_URL,
+
+          step: "shop",
+          phase: "idle", // idle | rendering | armed | completing | stalled | charging | done
+          environment: "prod",
+          currency: "JOD",
+          merchant: "main", // BAE path only: "main" or "sub" (hierarchy test)
+          captureMode: "capture", // "capture" (sale) | "auth" (hold); CYBS only
+          applePayOn: true, // CYBS only: include APPLEPAY in allowedPaymentTypes
+          saveCard: false, // CYBS only: offer to save the card (TMS)
+          adminToken: "", // for void / refund / charge / lookup (CYBS_ADMIN_TOKEN)
+          lastTxnId: null, // transaction of the last CYBS payment or charge
+          savedCustomerId: null, // TMS customer token from a saved card
+          // Payment tools page
+          toolTxn: "",
+          toolAmount: "",
+          toolCurrency: "JOD",
+          toolCustomer: "",
+          toolBusy: false,
+          toolOk: true,
+          toolStatus: "",
+          toolLast: "",
+          toolHistory: [],
+          // BIN Lookup (TOOLS page)
+          binInput: "",
+          binEnv: "production", // "production" | "test"
+          binBusy: false,
+          binError: "",
+          binNotice: "",
+          binResult: null,
+          binRaw: "",
+          binFromTxn: "", // set when a transaction lookup filled the BIN
+          forceManualConfirm: false,
+          loading: false,
+          loadingMessage: "Initialising…",
+          customAmount: "1.00", // kept as typed (string), never reformatted
+          cart: [],
+          total: 0, // numeric copy, for display helpers only
+          totalText: "0.00", // exact amount sent as totalAmount
+          // BAE path: comma-separated targetOrigins; default = the single
+          // origin the worker always used, so existing tests are unchanged.
+          targetOriginsInput: "https://ziadqula28.github.io",
+          originsError: "",
+          reference: null,
+          heldAuthRef: null, // reference of an AUTH-held txn awaiting capture
+          capturing: false,
+          log: [],
+          t0: Date.now(),
+          diag: {
+            engine: IS_IOS ? "WebKit / iOS" : "non-iOS",
+            shim: "idle",
+            theme: "—",
+          },
+          pollTimer: null,
+          stallTimer: null,
+
+          /* ---- JWT extraction state ---- */
+          captureContext: null,
+          showJwt: false,
+          jwtMerchantLabel: "—",
+
+          products: [
+            { id: 1, name: "Basic", price: 0.1, desc: "Entry tier." },
+            { id: 2, name: "Standard", price: 0.2, desc: "Popular tier." },
+            { id: 3, name: "Premium", price: 0.3, desc: "Top tier." },
+            {
+              id: 4,
+              name: "Custom",
+              price: 0,
+              desc: "Your amount.",
+              isCustom: true,
+            },
+          ],
+
+          init() {
+            window.BaePay.app = this;
+            this.logLine("harness ready · " + this.diag.engine);
+
+            // Diagnostic: record every cross-origin message the SDK relies on.
+            window.addEventListener(
+              "message",
+              (e) => {
+                if (e.origin === window.location.origin) return;
+                this.logLine("postMessage from " + e.origin);
+              },
+              true,
+            );
+
+            // Issue 3: the tab woke up — verify the payment server-side.
+            document.addEventListener("visibilitychange", () => {
+              this.logLine("visibility → " + document.visibilityState);
+              if (document.visibilityState !== "visible") return;
+              if (!this.reference || window.BaePay.settled) return;
+              if (this.phase === "completing" || this.phase === "stalled") {
+                this.logLine("tab resumed mid-3DS, starting status poll");
+                this.pollStatus(0);
+              }
+            });
+
+            window.addEventListener("pageshow", (e) => {
+              if (e.persisted) this.logLine("restored from bfcache");
+            });
+          },
+
+          logLine(msg) {
+            this.log.push({ id: Math.random(), t: Date.now() - this.t0, msg });
+            console.log("[bae]", msg);
+          },
+
+          copyLog() {
+            const text = this.log.map((l) => l.t + "ms " + l.msg).join("\n");
+            navigator.clipboard.writeText(text);
+          },
+
+          /* ================================================================
+           * JWT extraction
+           * ============================================================== */
+
+          /**
+           * Called the moment the capture context lands, before anything
+           * downstream can throw. Stores the raw token in Alpine state, on
+           * window.BaePay, and in the console, then reports what the payload
+           * actually contains — merchant identity and any styling keys.
+           */
+          captureJwt(token) {
+            this.captureContext = token || null;
+            window.BaePay.captureContext = token || null;
+
+            if (!token) {
+              this.logLine("WARNING: response had no token field");
+              this.diag.theme = "no token";
+              return;
+            }
+
+            // Console copy. Chrome folds very long single-line strings, so
+            // the markers make it obvious where the value starts and ends.
+            console.log("=== CAPTURE CONTEXT JWT (raw, undecoded) ===");
+            console.log(token);
+            console.log("=== END JWT · length " + token.length + " ===");
+            console.log(
+              "Tip: run  copy(BaePay.captureContext)  to put it on the clipboard.",
+            );
+
+            const decoded = this.decodeJwt(token);
+            const data =
+              (decoded &&
+                decoded.ctx &&
+                decoded.ctx[0] &&
+                decoded.ctx[0].data) ||
+              {};
+
+            // Merchant identity — compare this against the MID you published
+            // Look & Feel from in the Business Center.
+            this.jwtMerchantLabel =
+              decoded.iss ||
+              decoded.merchantId ||
+              data.merchantId ||
+              decoded.orgId ||
+              decoded.organizationId ||
+              "issuer unknown";
+
+            this.logLine(
+              "JWT top-level keys: " + JSON.stringify(Object.keys(decoded)),
+            );
+            this.logLine(
+              "JWT ctx[0].data keys: " + JSON.stringify(Object.keys(data)),
+            );
+            this.logLine("JWT issuer/merchant: " + this.jwtMerchantLabel);
+            // Which MID minted this session (main vs sub-account test).
+            const midKey = /^(merchantId|merchantID|mid|organizationId|orgId)$/;
+            const findMid = (o, depth) => {
+              if (!o || typeof o !== "object" || depth > 6) return null;
+              for (const [k, v] of Object.entries(o)) {
+                if (midKey.test(k) && (typeof v === "string" || typeof v === "number"))
+                  return String(v);
+              }
+              for (const v of Object.values(o)) {
+                const hit = findMid(v, depth + 1);
+                if (hit) return hit;
+              }
+              return null;
+            };
+            this.logLine(
+              "JWT merchant ID: " +
+                (findMid(decoded, 0) || "not in token, check the Business Center"),
+            );
+            // What the token says, as opposed to what we sent.
+            const findKey = (o, key, depth) => {
+              if (!o || typeof o !== "object" || depth > 6) return undefined;
+              if (Object.prototype.hasOwnProperty.call(o, key)) return o[key];
+              for (const v of Object.values(o)) {
+                const hit = findKey(v, key, depth + 1);
+                if (hit !== undefined) return hit;
+              }
+              return undefined;
+            };
+            const jwtOrigins = findKey(decoded, "targetOrigins", 0);
+            this.logLine(
+              "JWT targetOrigins: " +
+                (jwtOrigins !== undefined ? JSON.stringify(jwtOrigins) : "not in token"),
+            );
+            const jwtAmount = findKey(decoded, "totalAmount", 0);
+            const jwtCurrency = findKey(decoded, "currency", 0);
+            this.logLine(
+              "JWT totalAmount: " +
+                (jwtAmount !== undefined
+                  ? JSON.stringify(jwtAmount) + (jwtCurrency ? " " + jwtCurrency : "")
+                  : "not in token"),
+            );
+
+            // Match loosely: styling key names have moved between SDK
+            // versions, so don't assume one spelling.
+            const themeKeys = Object.keys(data).filter((k) =>
+              /theme|style|brand|colou?r|font|button|look|feel/i.test(k),
+            );
+            this.diag.theme = themeKeys.length
+              ? themeKeys.join(", ")
+              : "ABSENT";
+            this.logLine("theme-ish keys in JWT: " + this.diag.theme);
+
+            if (data.clientVersion) {
+              this.logLine("clientVersion pinned: " + data.clientVersion);
+            }
+            // What the session actually offers (proof for the Apple Pay test)
+            this.logLine(
+              "allowedPaymentTypes in JWT: " +
+                JSON.stringify(data.allowedPaymentTypes || null),
+            );
+            this.logLine(
+              "paymentConfigurations in JWT: " +
+                JSON.stringify(Object.keys(data.paymentConfigurations || {})),
+            );
+          },
+
+          copyJwt() {
+            if (!this.captureContext) return;
+            navigator.clipboard
+              .writeText(this.captureContext)
+              .then(() => this.logLine("JWT copied to clipboard"))
+              .catch(() =>
+                this.logLine("clipboard blocked — use Download instead"),
+              );
+          },
+
+          downloadJwt() {
+            if (!this.captureContext) return;
+            const blob = new Blob([this.captureContext], {
+              type: "text/plain",
+            });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download =
+              "capture-context-" + this.environment + "-" + Date.now() + ".txt";
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            this.logLine("JWT downloaded");
+          },
+
+          /* ============================================================ */
+
+          addToCart(product) {
+            // The custom amount is used exactly as typed: no rounding, no
+            // reformatting ("1.005" stays "1.005", "1.000" stays "1.000").
+            const priceText = product.isCustom
+              ? String(this.customAmount ?? "").trim()
+              : product.price.toFixed(2);
+            if (!/^\d+(\.\d+)?$/.test(priceText) || !(Number(priceText) > 0))
+              return alert("Enter an amount above 0, using digits and one dot (e.g. 1.005).");
+            this.cart.push({ ...product, price: Number(priceText), priceText });
+            this.totalText = this.sumAmounts(this.cart.map((i) => i.priceText));
+            this.total = Number(this.totalText);
+          },
+
+          // One item: its text as typed. Several: an exact decimal sum (no
+          // floating point) with as many decimals as the longest item.
+          sumAmounts(texts) {
+            if (texts.length === 1) return texts[0];
+            const scale = Math.max(0, ...texts.map((t) => (t.split(".")[1] || "").length));
+            const sum = texts.reduce((acc, t) => {
+              const [i, f = ""] = t.split(".");
+              return acc + BigInt(i + f.padEnd(scale, "0"));
+            }, 0n);
+            if (!scale) return sum.toString();
+            const digits = sum.toString().padStart(scale + 1, "0");
+            return digits.slice(0, -scale) + "." + digits.slice(-scale);
+          },
+
+          // Comma-separated field -> array of bare origins, or an error.
+          parseTargetOrigins() {
+            const list = String(this.targetOriginsInput || "")
+              .split(",")
+              .map((o) => o.trim())
+              .filter(Boolean);
+            if (!list.length) return { error: "Enter at least one origin." };
+            const bad = list.filter((o) => {
+              try {
+                const u = new URL(o);
+                return !(u.protocol === "https:" || u.protocol === "http:") || u.origin !== o;
+              } catch {
+                return true;
+              }
+            });
+            if (bad.length)
+              return {
+                error:
+                  "Not a bare origin (scheme://host[:port], no path or trailing slash): " +
+                  bad.join(", "),
+              };
+            return { origins: list };
+          },
+
+          reset() {
+            clearTimeout(this.stallTimer);
+            clearTimeout(this.pollTimer);
+            window.location.reload();
+          },
+
+          /* ---------------- phase 1: context + SDK + card entry ------- */
+          async startCheckout() {
+            let targetOrigins;
+            if (this.environment !== "cybersource") {
+              const parsed = this.parseTargetOrigins();
+              if (parsed.error) {
+                this.originsError = parsed.error;
+                return; // stay on the shop page, next to the field
+              }
+              targetOrigins = parsed.origins;
+            }
+            this.step = "checkout";
+            this.phase = "rendering";
+            this.loading = true;
+            this.loadingMessage = "Requesting checkout session…";
+            this.captureContext = null;
+            this.showJwt = false;
+            this.jwtMerchantLabel = "—";
+            this.diag.theme = "—";
+            document.getElementById("payment-selection-container").innerHTML =
+              "";
+            document.getElementById("payment-screen-container").innerHTML = "";
+
+            try {
+              // Direct-to-CyberSource mode uses a different route entirely.
+              const ccPath =
+                this.environment === "cybersource"
+                  ? "/cybs/capture-context"
+                  : "/capture-context";
+              this.logLine(
+                "capture-context → totalAmount " +
+                  JSON.stringify(this.totalText) +
+                  " " +
+                  this.currency +
+                  (targetOrigins ? " · targetOrigins " + JSON.stringify(targetOrigins) : ""),
+              );
+              const res = await fetch(this.PROXY + ccPath, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  totalAmount: this.totalText, // exactly as typed
+                  currency: this.currency,
+                  // BAE path only: passed through as a JSON array.
+                  targetOrigins,
+                  environment: this.environment,
+                  origin: window.location.origin,
+                  // BAE path only: which merchant key the worker uses.
+                  merchant:
+                    this.environment === "cybersource" ? undefined : this.merchant,
+                  // Only the CYBS path honors this; harmless on the BAE path.
+                  mode:
+                    this.environment === "cybersource"
+                      ? this.captureMode
+                      : undefined,
+                  // CYBS path only: which payment methods this session offers.
+                  paymentTypes:
+                    this.environment === "cybersource"
+                      ? this.applePayOn
+                        ? ["PANENTRY", "APPLEPAY", "GOOGLEPAY"]
+                        : ["PANENTRY", "GOOGLEPAY"]
+                      : undefined,
+                  // CYBS path only: offer to save the card (TMS token).
+                  saveCard:
+                    this.environment === "cybersource" ? this.saveCard : undefined,
+                }),
+              });
+
+              const data = await res.json();
+              if (!res.ok)
+                throw new Error(
+                  data.error +
+                    " — " +
+                    (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || "")) +
+                    (data.bad ? " " + JSON.stringify(data.bad) : ""),
+                );
+
+              this.reference = data.reference;
+              window.BaePay.reference = data.reference;
+              this.logLine(
+                "capture context received · ref " +
+                  data.reference +
+                  (data.merchant ? " · merchant " + data.merchant : ""),
+              );
+
+              // ---- RAW JWT: surface it before anything can throw --------
+              this.captureJwt(data.token);
+              // -----------------------------------------------------------
+
+              if (data.storage === "memory") {
+                this.logLine(
+                  "WARNING: worker has no KV binding, recovery is unreliable",
+                );
+              }
+
+              this.loadingMessage = "Loading payment SDK…";
+              await this.loadSdk(
+                data.clientLibrary,
+                data.clientLibraryIntegrity,
+              );
+
+              const accept = await Accept(data.token);
+              const up = await accept.unifiedPayments();
+              window.BaePay.up = up;
+
+              this.loading = false;
+              this.logLine("rendering payment selection");
+
+              // Resolves when the customer submits their card inside the
+              // SDK iframe. That click belongs to the iframe — the parent
+              // window holds no activation at this point, which is exactly
+              // why we do NOT chain complete() onto it.
+              const transientToken = await up.show({
+                containers: {
+                  paymentSelection: "#payment-selection-container",
+                },
+              });
+
+              if (!transientToken)
+                throw new Error("show() returned no transient token");
+              window.BaePay.transientToken = transientToken;
+              this.logLine("transient token captured");
+
+              // Inspect which payment method was actually used before
+              // deciding whether to require the manual tap. The pop-up
+              // timing fix (Issue 2) only applies to manually entered
+              // cards, where the SDK opens a 3DS window after show()
+              // resolves. Apple Pay (and likely Click to Pay) already
+              // carries a strong native user gesture from Face ID / Touch
+              // ID / device recognition and shouldn't need this extra tap.
+              const decodedToken = this.decodeJwt(transientToken);
+              const paymentInfo = decodedToken?.paymentInformation || {};
+              this.logLine(
+                "paymentInformation keys: " +
+                  JSON.stringify(Object.keys(paymentInfo)),
+              );
+
+              const isManualCard = Object.prototype.hasOwnProperty.call(
+                paymentInfo,
+                "card",
+              );
+
+              if ((IS_IOS && isManualCard) || this.forceManualConfirm) {
+                // Ask for one real tap in the top-level document — needed
+                // for manually entered cards on iOS, where WebKit's pop-up
+                // grant expires before the SDK's own window.open() fires.
+                this.phase = "armed";
+                this.logLine(
+                  "awaiting top-level tap before complete() (card on iOS)",
+                );
+              } else {
+                // Apple Pay, Click to Pay, or desktop: no pop-up timing
+                // issue, auto-confirm as before.
+                this.phase = "armed";
+                this.$nextTick(() => window.BaePay.confirmTap());
+              }
+            } catch (err) {
+              this.fail(err.message);
+            }
+          },
+
+          loadSdk(url, integrity) {
+            return new Promise((resolve, reject) => {
+              const existing = document.querySelector(
+                "script[data-cybersource-sdk]",
+              );
+              if (existing) existing.remove();
+              try {
+                delete window.Accept;
+              } catch (e) {}
+
+              const script = document.createElement("script");
+              script.src = url;
+              script.async = true;
+              script.setAttribute("data-cybersource-sdk", "true");
+              if (integrity) {
+                script.integrity = integrity;
+                script.crossOrigin = "anonymous";
+              }
+              script.onerror = () =>
+                reject(new Error("SDK failed to load: " + url));
+              script.onload = () => {
+                // Poll instead of a fixed 200ms guess.
+                let tries = 0;
+                const tick = () => {
+                  if (typeof window.Accept === "function") return resolve();
+                  if (++tries > 100)
+                    return reject(new Error("Accept never appeared"));
+                  setTimeout(tick, 50);
+                };
+                tick();
+              };
+              document.body.appendChild(script);
+            });
+          },
+
+          /* ---------------- phase 2: 3DS ------------------------------ */
+          onCompleteStarted() {
+            this.phase = "completing";
+            this.loading = true;
+            this.loadingMessage = "Verifying with your bank…";
+            this.logLine("complete() invoked");
+
+            // Issue 3 safety net: if nothing comes back, offer recovery.
+            clearTimeout(this.stallTimer);
+            this.stallTimer = setTimeout(() => {
+              if (this.phase === "completing") {
+                this.logLine("no response after 90s, marking stalled");
+                this.loading = false;
+                this.phase = "stalled";
+                this.pollStatus(0);
+              }
+            }, 90000);
+          },
+
+          onCompleteResolved(result) {
+            clearTimeout(this.stallTimer);
+            this.logLine("complete() resolved");
+
+            const decoded = this.decodeJwt(result);
+            const status = decoded.status || decoded.outcome;
+
+            // On the direct CYBS path we always record the result server-side
+            // (charge() posts to /cybs/result). That's what stores the auth
+            // transaction id and tells us whether a follow-on capture is
+            // available (AUTH mode) or the sale is already done (CAPTURE mode).
+            if (this.environment === "cybersource") {
+              return this.charge(result);
+            }
+
+            // BAE path: AUTHORIZED here means already captured (sale).
+            if (status === "AUTHORIZED") {
+              this.logLine("auto-authorised, no capture call needed");
+              window.BaePay.settled = true;
+              return this.showSuccess("Authorised");
+            }
+            this.charge(result);
+          },
+
+          onCompleteRejected(err) {
+            clearTimeout(this.stallTimer);
+            const msg =
+              (err && (err.message || err.reason || err.code)) || String(err);
+            this.logLine("complete() rejected: " + msg);
+
+            // COMPLETE_AUTHENTICATION_FAILED after a real OTP is usually a
+            // lost postMessage, not a real decline. Ask the server.
+            this.loading = false;
+            this.phase = "stalled";
+            this.pollStatus(0);
+          },
+
+          /* ---------------- phase 3: capture -------------------------- */
+          async charge(completeResult) {
+            this.phase = "charging";
+            this.loading = true;
+            this.loadingMessage = "Completing payment…";
+            document.getElementById("payment-selection-container").innerHTML =
+              "";
+
+            // Direct mode uses completeMandate CAPTURE, so up.complete() has
+            // already authorised and captured. Nothing left to charge — just
+            // record the outcome and index the transaction id.
+            if (this.environment === "cybersource") {
+              try {
+                const res = await fetch(this.PROXY + "/cybs/result", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    reference: this.reference,
+                    result: completeResult,
+                  }),
+                });
+                const data = await res.json();
+                this.logLine(
+                  "cybs result recorded · txn " +
+                    (data.transactionId || "n/a") +
+                    " · " +
+                    (data.status || "?"),
+                );
+                window.BaePay.settled = true;
+                this.lastTxnId = data.transactionId || null;
+                if (data.tokens && Object.keys(data.tokens).length) {
+                  this.logLine("saved card tokens: " + JSON.stringify(data.tokens));
+                  this.savedCustomerId = data.tokens.customer || this.savedCustomerId;
+                } else if (this.saveCard) {
+                  this.logLine(
+                    "no TMS token returned (card not saved, a wallet was used, or TMS not enabled)",
+                  );
+                }
+
+                // AUTH mode: funds are HELD, not captured. Remember this
+                // reference and offer a Capture button.
+                if (data.status === "AUTHORIZED_HELD") {
+                  if (data.captureAvailable) {
+                    this.heldAuthRef = this.reference;
+                    return this.showSuccess(
+                      "Authorized (funds held) — ready to capture",
+                    );
+                  }
+                  // Held but we couldn't get an auth id to capture with.
+                  this.logLine(
+                    "WARNING: authorized but no transaction id returned — " +
+                      "capture not available (see worker log)",
+                  );
+                  return this.showSuccess("Authorized (funds held)");
+                }
+
+                // CAPTURE mode: sale complete.
+                return this.showSuccess("Paid");
+              } catch (err) {
+                this.fail("Result recording failed: " + err.message);
+                return;
+              }
+            }
+
+            try {
+              const res = await fetch(this.PROXY + "/process-payment", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  reference: this.reference,
+                  transientToken: completeResult,
+                  environment: this.environment,
+                  merchant: this.merchant,
+                }),
+              });
+              const data = await res.json();
+              this.logLine("charge → " + (data.status || res.status));
+
+              if (data.status === "COMPLETED") {
+                window.BaePay.settled = true;
+                return this.showSuccess("Paid");
+              }
+              this.fail(
+                "Payment declined: " +
+                  (data.gatewayStatus || JSON.stringify(data)),
+              );
+            } catch (err) {
+              this.fail("Charge request failed: " + err.message);
+            }
+          },
+
+          /* ---------------- recovery poller (Issue 3) ----------------- */
+          async pollStatus(attempt) {
+            if (window.BaePay.settled || attempt > 10) return;
+            try {
+              const res = await fetch(
+                this.PROXY +
+                  "/payment-status?reference=" +
+                  encodeURIComponent(this.reference),
+              );
+              const data = await res.json();
+              this.logLine("poll " + attempt + " → " + data.status);
+
+              if (data.status === "COMPLETED") {
+                window.BaePay.settled = true;
+                clearTimeout(this.stallTimer);
+                return this.showSuccess("Paid");
+              }
+              if (data.status === "DECLINED") {
+                window.BaePay.settled = true;
+                return this.fail("Payment declined by the bank.");
+              }
+            } catch (err) {
+              this.logLine("poll error: " + err.message);
+            }
+            this.pollTimer = setTimeout(
+              () => this.pollStatus(attempt + 1),
+              Math.min(1000 * Math.pow(1.6, attempt), 8000),
+            );
+          },
+
+          /* ---------------- helpers ----------------------------------- */
+          decodeJwt(value) {
+            try {
+              if (typeof value === "string" && value.split(".").length >= 2) {
+                let b64 = value
+                  .split(".")[1]
+                  .replace(/-/g, "+")
+                  .replace(/_/g, "/");
+                while (b64.length % 4) b64 += "=";
+                return JSON.parse(decodeURIComponent(escape(atob(b64))));
+              }
+              if (value && typeof value === "object") return value;
+            } catch (e) {
+              this.logLine("jwt decode failed");
+            }
+            return {};
+          },
+
+          showSuccess(label) {
+            clearTimeout(this.pollTimer);
+            this.phase = "done";
+            this.loading = false;
+            document.getElementById("payment-selection-container").innerHTML =
+              "";
+            if (window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(
+                JSON.stringify({
+                  event: "payment_success",
+                  reference: this.reference,
+                }),
+              );
+            }
+            // If this was an AUTH-only hold, offer a Capture button that
+            // collects the held funds via /cybs/capture.
+            const captureBtn = this.heldAuthRef
+              ? '<button id="capture-held-btn" ' +
+                'class="mt-6 mb-1 block mx-auto px-5 py-2.5 rounded-xl bg-amber-600 text-white font-bold">' +
+                "Capture held funds</button>" +
+                '<p class="text-gray-400 text-xs mt-1">Funds are authorized (held) but not yet collected.</p>'
+              : "";
+
+            document.getElementById("payment-screen-container").innerHTML =
+              '<div class="text-center py-10">' +
+              '<div class="w-16 h-16 bg-green-600 text-white rounded-full flex items-center justify-center mx-auto mb-4 text-3xl">✓</div>' +
+              '<h3 class="text-2xl font-black">' +
+              label +
+              "</h3>" +
+              '<p class="text-gray-500 mt-2 text-sm font-mono">' +
+              this.reference +
+              "</p>" +
+              captureBtn +
+              this.cybsActionsHtml() +
+              '<button onclick="window.location.reload()" class="mt-6 text-blue-600 font-bold">Run another test</button>' +
+              "</div>";
+
+            // Wire the capture button (added via innerHTML, so bind directly).
+            if (this.heldAuthRef) {
+              const btn = document.getElementById("capture-held-btn");
+              if (btn) btn.addEventListener("click", () => this.captureHeld());
+            }
+            this.bindCybsActions();
+          },
+
+          /* ---------- CYBS: void / refund / saved-card charge / lookup ---------- */
+          cybsActionsHtml() {
+            if (this.environment !== "cybersource" || !this.lastTxnId) return "";
+            const input =
+              'class="w-full border rounded-lg px-3 py-2 text-sm mt-1"';
+            return (
+              '<div class="mt-8 text-left border-t pt-4">' +
+              '<p class="text-xs font-bold tracking-widest text-gray-500">PAYMENT ACTIONS (CYBS)</p>' +
+              '<label class="block text-xs text-gray-500 mt-3">Transaction ID</label>' +
+              '<input id="cybs-txn" ' + input + ' value="' + this.lastTxnId + '">' +
+              '<label class="block text-xs text-gray-500 mt-3">Amount (refund or saved-card charge)</label>' +
+              '<input id="cybs-amount" type="number" step="0.001" ' + input + ' value="' + Number(this.total).toFixed(this.currency === "JOD" ? 3 : 2) + '">' +
+              '<label class="block text-xs text-gray-500 mt-3">Saved card (customer token)</label>' +
+              '<input id="cybs-customer" ' + input + ' value="' + (this.savedCustomerId || "") + '">' +
+              '<label class="block text-xs text-gray-500 mt-3">Admin token</label>' +
+              '<input id="cybs-admin" type="password" autocomplete="off" ' + input + ' value="' + (this.adminToken || "") + '">' +
+              '<div class="flex flex-wrap gap-2 mt-4">' +
+              '<button id="cybs-void" class="px-4 py-2 rounded-lg bg-gray-800 text-white text-sm font-bold">Void</button>' +
+              '<button id="cybs-refund" class="px-4 py-2 rounded-lg bg-gray-800 text-white text-sm font-bold">Refund</button>' +
+              '<button id="cybs-charge" class="px-4 py-2 rounded-lg bg-emerald-700 text-white text-sm font-bold">Charge saved card</button>' +
+              '<button id="cybs-lookup" class="px-4 py-2 rounded-lg border text-sm font-bold">Look up</button>' +
+              '</div>' +
+              '<p id="cybs-action-status" class="text-sm mt-3 text-gray-600"></p>' +
+              "</div>"
+            );
+          },
+
+          bindCybsActions() {
+            const on = (id, fn) => {
+              const el = document.getElementById(id);
+              if (el) el.addEventListener("click", fn);
+            };
+            on("cybs-void", () => this.cybsAction("/cybs/void", {}));
+            on("cybs-refund", () =>
+              this.cybsAction("/cybs/refund", { amount: this.cybsVal("cybs-amount"), currency: this.currency }),
+            );
+            on("cybs-charge", () =>
+              this.cybsAction("/cybs/charge-token", {
+                customerId: this.cybsVal("cybs-customer"),
+                amount: this.cybsVal("cybs-amount"),
+                currency: this.currency,
+              }),
+            );
+            on("cybs-lookup", () => this.cybsAction("/cybs/transaction", {}));
+          },
+
+          cybsVal(id) {
+            const el = document.getElementById(id);
+            return el ? el.value.trim() : "";
+          },
+
+          /* ---------------- Payment tools page ---------------- */
+          openTools() {
+            this.toolTxn = this.toolTxn || this.lastTxnId || "";
+            this.toolCustomer = this.toolCustomer || this.savedCustomerId || "";
+            this.toolCurrency = this.currency;
+            this.step = "tools";
+            window.scrollTo(0, 0);
+          },
+
+          async toolAction(kind) {
+            const paths = {
+              void: "/cybs/void",
+              refund: "/cybs/refund",
+              charge: "/cybs/charge-token",
+              lookup: "/cybs/transaction",
+            };
+            const fail = (t) => { this.toolOk = false; this.toolStatus = t; };
+            if (kind !== "charge" && !this.toolTxn) return fail("Enter a transaction ID.");
+            if (kind === "charge" && !this.toolCustomer) return fail("Enter the customer token.");
+            if ((kind === "refund" || kind === "charge") && !(Number(this.toolAmount) > 0))
+              return fail("Enter an amount.");
+
+            const body = { transactionId: this.toolTxn };
+            if (kind === "refund" || kind === "charge") {
+              body.amount = this.toolAmount;
+              body.currency = this.toolCurrency;
+            }
+            if (kind === "charge") body.customerId = this.toolCustomer;
+
+            this.toolBusy = true;
+            this.toolOk = true;
+            this.toolStatus = "Working…";
+            this.logLine("tools " + kind + " → " + JSON.stringify(body));
+            try {
+              const res = await fetch(this.PROXY + paths[kind], {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Admin-Token": this.adminToken || "",
+                },
+                body: JSON.stringify(body),
+              });
+              const data = await res.json().catch(() => ({}));
+              this.toolLast = JSON.stringify(data, null, 2);
+              this.logLine("tools " + kind + " ← " + res.status + " " + JSON.stringify(data).slice(0, 1500));
+              this.toolOk = res.ok;
+              const summary = res.ok
+                ? kind + ": " + (data.status || "ok") +
+                  (data.transactionId ? " · txn " + data.transactionId : "") +
+                  (data.refundId ? " · refund " + data.refundId : "") +
+                  (data.amount ? " · " + data.amount + " " + this.toolCurrency : "")
+                : kind + " failed: " + (data.reason || data.error || "HTTP " + res.status) +
+                  (data.status ? " (status " + data.status + ")" : "");
+              this.toolStatus = summary;
+              this.toolHistory.unshift(new Date().toLocaleTimeString() + "  " + summary);
+              if (kind === "charge" && res.ok && data.transactionId) this.toolTxn = data.transactionId;
+              // A transaction lookup carries the card prefix: offer it to BIN Lookup.
+              if (kind === "lookup" && res.ok) {
+                const prefix = data.response?.paymentInformation?.card?.prefix;
+                const digits = prefix ? String(prefix).replace(/\D/g, "") : "";
+                if (digits.length >= 6 && digits.length <= 8) {
+                  this.binInput = digits;
+                  this.binFromTxn = this.toolTxn;
+                }
+              }
+            } catch (err) {
+              this.toolOk = false;
+              this.toolStatus = "Error: " + err.message;
+            } finally {
+              this.toolBusy = false;
+            }
+          },
+
+          /* ---------------- BIN Lookup ---------------- */
+          countryLabel(code) {
+            if (!code) return null;
+            try {
+              const name = new Intl.DisplayNames(["en"], { type: "region" }).of(String(code).toUpperCase());
+              return name && name !== code ? code + " (" + name + ")" : String(code);
+            } catch {
+              return String(code);
+            }
+          },
+
+          // Rows for the result table: only fields CyberSource returned.
+          get binRows() {
+            const r = this.binResult;
+            if (!r || r.match !== "FOUND") return [];
+            const rows = [];
+            const add = (label, value, strong) => {
+              if (value !== undefined && value !== null && value !== "")
+                rows.push({ label, value: String(value), strong: Boolean(strong) });
+            };
+            const f = r.features || {};
+            const brandNames = (r.brands || []).map((b) => b.brandName || b.type).filter(Boolean);
+            add("BIN", r.bin);
+            add("Issuing bank", r.issuer && r.issuer.name, true);
+            add("Card network", (r.card && r.card.brandName) || brandNames[0]);
+            if (brandNames.length > 1) add("All brands", brandNames.join(", "));
+            add("Issuer country", r.issuer && this.countryLabel(r.issuer.country));
+            add(
+              "Card type",
+              f.accountFundingSource
+                ? f.accountFundingSource + (f.accountFundingSourceSubType ? " (" + f.accountFundingSourceSubType + ")" : "")
+                : f.accountFundingSourceSubType,
+            );
+            add("Card product", f.cardProduct);
+            add("Card platform", f.cardPlatform);
+            add("Card currency", r.card && r.card.currency);
+            add("Credential type", r.card && r.card.credentialType);
+            add("Issuer BIN length", r.issuer && r.issuer.binLength);
+            add("Account prefix", r.issuer && r.issuer.accountPrefix);
+            add("Issuer phone", r.issuer && r.issuer.phoneNumber);
+            add("CyberSource request ID", r.requestId);
+            return rows;
+          },
+
+          async lookupBin() {
+            this.binError = "";
+            this.binNotice = "";
+            this.binResult = null;
+            this.binRaw = "";
+            const bin = String(this.binInput || "").replace(/[\s-]/g, "");
+            if (!bin) return (this.binError = "Enter a BIN.");
+            if (!/^\d+$/.test(bin)) return (this.binError = "A BIN contains digits only.");
+            if (bin.length < 6) return (this.binError = "Enter at least the first 6 digits.");
+            if (bin.length > 8) {
+              this.binInput = ""; // don't leave a card number on screen
+              return (this.binError = "Enter only the first 6 to 8 digits. Full card numbers are not accepted.");
+            }
+            if (!this.adminToken) return (this.binError = "Enter the admin token in Payment tools above.");
+
+            this.binBusy = true;
+            this.logLine("bin-lookup → " + this.binEnv + " · " + bin);
+            try {
+              const res = await fetch(this.PROXY + "/cybs/bin-lookup", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "X-Admin-Token": this.adminToken },
+                body: JSON.stringify({ bin, environment: this.binEnv }),
+              });
+              const data = await res.json().catch(() => ({}));
+              this.logLine("bin-lookup ← " + res.status + " " + (data.match || data.error || ""));
+              this.binRaw = data.response ? JSON.stringify(data.response, null, 2) : "";
+              if (!res.ok) {
+                this.binError =
+                  data.error === "admin_token_required"
+                    ? "The admin token is wrong or missing."
+                    : data.message || data.error || "Request failed with HTTP " + res.status + ".";
+                if (data.httpStatus) this.binError += " (CyberSource HTTP " + data.httpStatus + ")";
+                return;
+              }
+              this.binResult = data;
+              if (data.match === "MULTIPLE")
+                this.binNotice = "More than one card range starts with these digits. Try all 8 digits of the Account Prefix.";
+              else if (data.match === "NO_MATCH") this.binNotice = "CyberSource has no record for this BIN.";
+              else if (data.match === "UNKNOWN")
+                this.binNotice = "Unexpected status from CyberSource: " + (data.status || "none") + ". See the response below.";
+              else if (!data.issuerNameReturned) this.binNotice = "CyberSource didn't return an issuer name for this BIN.";
+            } catch (err) {
+              this.binError = "Could not reach the worker: " + err.message;
+            } finally {
+              this.binBusy = false;
+            }
+          },
+
+          async cybsAction(path, extra) {
+            const statusEl = document.getElementById("cybs-action-status");
+            const say = (t) => statusEl && (statusEl.textContent = t);
+            this.adminToken = this.cybsVal("cybs-admin") || this.adminToken;
+            const transactionId = this.cybsVal("cybs-txn");
+            say("Working…");
+            this.logLine(path + " → txn " + (transactionId || "n/a"));
+            try {
+              const res = await fetch(this.PROXY + path, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Admin-Token": this.adminToken || "",
+                },
+                body: JSON.stringify({ transactionId, reference: this.reference, ...extra }),
+              });
+              const data = await res.json();
+              this.logLine(path + " ← " + res.status + " " + JSON.stringify(data).slice(0, 1500));
+              if (!res.ok) {
+                say("Failed: " + (data.reason || data.error || (data.response && (data.response.message || data.response.reason)) || res.status) + (data.status ? " (status " + data.status + ")" : ""));
+                return;
+              }
+              if (path === "/cybs/charge-token" && data.transactionId) {
+                this.lastTxnId = data.transactionId;
+                const txnEl = document.getElementById("cybs-txn");
+                if (txnEl) txnEl.value = data.transactionId;
+              }
+              say(
+                (data.action || path) + ": " + (data.status || "ok") +
+                  (data.transactionId ? " · txn " + data.transactionId : "") +
+                  (data.refundId ? " · refund " + data.refundId : "") +
+                  (path === "/cybs/transaction" ? " · details in the log" : ""),
+              );
+            } catch (err) {
+              say("Error: " + err.message);
+            }
+          },
+
+          /* ---------------- follow-on capture (pre-auth flow) ---------- */
+          async captureHeld() {
+            if (!this.heldAuthRef || this.capturing) return;
+            this.capturing = true;
+            const btn = document.getElementById("capture-held-btn");
+            if (btn) {
+              btn.textContent = "Capturing…";
+              btn.disabled = true;
+            }
+            this.logLine("capture → " + this.heldAuthRef);
+            try {
+              const res = await fetch(this.PROXY + "/cybs/capture", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ reference: this.heldAuthRef }),
+              });
+              const data = await res.json();
+              if (!res.ok) {
+                this.logLine(
+                  "capture failed: " +
+                    (data.error || res.status) +
+                    " — " +
+                    JSON.stringify(data.detail || "").slice(0, 200),
+                );
+                if (btn) {
+                  btn.textContent = "Capture failed — retry";
+                  btn.disabled = false;
+                }
+                this.capturing = false;
+                return;
+              }
+              this.logLine(
+                "captured · captureId " +
+                  (data.captureId || "n/a") +
+                  " · status " +
+                  (data.captureStatus || "?"),
+              );
+              this.heldAuthRef = null;
+              if (btn) {
+                btn.textContent = "✓ Captured";
+                btn.classList.remove("bg-amber-600");
+                btn.classList.add("bg-green-600");
+              }
+            } catch (err) {
+              this.logLine("capture error: " + err.message);
+              if (btn) {
+                btn.textContent = "Capture failed — retry";
+                btn.disabled = false;
+              }
+              this.capturing = false;
+            }
+          },
+
+          fail(message) {
+            clearTimeout(this.stallTimer);
+            this.loading = false;
+            this.phase = "idle";
+            this.logLine("FAIL " + message);
+            document.getElementById("payment-screen-container").innerHTML =
+              '<div class="text-center py-8">' +
+              '<div class="w-14 h-14 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-3 text-2xl">!</div>' +
+              '<h3 class="text-lg font-bold">Payment not completed</h3>' +
+              '<p class="text-gray-500 mt-2 text-sm">' +
+              message +
+              "</p>" +
+              '<button onclick="window.location.reload()" class="mt-5 text-blue-600 font-bold">Try again</button>' +
+              "</div>";
+          },
+        };
       }
-      if (url.pathname.endsWith("/payment-result")) {
-        return await handlePaymentResult(request, env, body);
-      }
-      if (url.pathname.endsWith("/cybs/result")) {
-        return await handleCybsResult(request, env, body);
-      }
-      if (url.pathname.endsWith("/cybs/capture")) {
-        return await handleCybsCapture(request, env, body);
-      }
-      if (url.pathname.endsWith("/cybs/void")) {
-        return await handleCybsVoid(request, env, body);
-      }
-      if (url.pathname.endsWith("/cybs/refund")) {
-        return await handleCybsRefund(request, env, body);
-      }
-      if (url.pathname.endsWith("/cybs/charge-token")) {
-        return await handleCybsChargeToken(request, env, body);
-      }
-      if (url.pathname.endsWith("/cybs/transaction")) {
-        return await handleCybsTransaction(request, env, body);
-      }
-      if (url.pathname.endsWith("/cybs/bin-lookup")) {
-        return await handleCybsBinLookup(request, env, body);
-      }
-      if (url.pathname.endsWith("/process-payment")) {
-        return await handleProcessPayment(request, env, body);
-      }
-      return await handleCaptureContext(request, env, body);
-    } catch (err) {
-      console.error("worker error", err?.stack);
-      return json(
-        { error: "worker_exception", detail: err.message },
-        500,
-        request,
-      );
-    }
-  },
-};
+    </script>
+  </body>
+</html>
